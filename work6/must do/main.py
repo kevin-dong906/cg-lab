@@ -1,248 +1,178 @@
 import taichi as ti
-import numpy as np
 
-# ====================== 完全匹配参考图的参数 ======================
 ti.init(arch=ti.gpu)
 
-N = 20                  # 参考图标准20x20网格
+N = 20
 mass = 1.0
 dt = 5e-4
-k_s = 12000.0           # 弹簧刚度，和参考图下垂弧度完全匹配
-k_d = 0.8               # 阻尼，摆动自然不生硬
+k_s = 10000.0
+k_d = 1.0
 gravity = ti.Vector([0.0, -9.8, 0.0])
-max_velocity = 40.0
+max_velocity = 50.0
 
-# 质点数据
 x = ti.Vector.field(3, float, N * N)
 v = ti.Vector.field(3, float, N * N)
+f = ti.Vector.field(3, float, N * N)
 is_fixed = ti.field(int, N * N)
 
-# 弹簧拓扑（结构弹簧：上下左右）
-spring_neighbors = ti.field(int, (N * N, 4))
-spring_rest_len = ti.field(float, (N * N, 4))
-
-# 隐式欧拉迭代缓存
 x_next = ti.Vector.field(3, float, N * N)
 v_next = ti.Vector.field(3, float, N * N)
+f_next = ti.Vector.field(3, float, N * N)
 
-# 线框渲染索引
-line_indices = ti.field(int, 2 * (N * (N - 1) + (N - 1) * N))
-
-# 控制变量
-solver_type = ti.field(int, ())
-paused = ti.field(int, ())
-
-# ====================== 任务1：分Kernel初始化（GPU同步） ======================
-@ti.kernel
-def init_control():
-    solver_type[None] = 1    # 默认半隐式欧拉，和参考图一致
-    paused[None] = 0
+max_springs = N * N * 4
+spring_indices = ti.field(int, max_springs * 2)
+spring_pairs = ti.Vector.field(2, int, max_springs)
+spring_lengths = ti.field(float, max_springs)
+num_springs = ti.field(int, ())
 
 @ti.kernel
-def init_particle_pos():
-    for i in range(N * N):
-        row = i // N
-        col = i % N
-        # ✅ 关键：初始完美正方形网格，x和z轴间距一致
-        x[i] = ti.Vector([col * 0.1, 2.0, row * 0.1])
-        v[i] = ti.Vector([0.0, 0.0, 0.0])
-        is_fixed[i] = 0
-        # ✅ 只固定左上角(0,0)和右上角(0,N-1)两个点
-        if (row == 0 and col == 0) or (row == 0 and col == N - 1):
-            is_fixed[i] = 1
+def init_positions():
+    for i, j in ti.ndrange(N, N):
+        idx = i * N + j
+        x[idx] = ti.Vector([i * 0.05 - 0.5, 0.8, j * 0.05 - 0.5])
+        v[idx] = ti.Vector([0.0, 0.0, 0.0])
+        f[idx] = ti.Vector([0.0, 0.0, 0.0])
+        if j == 0 and (i == 0 or i == N-1):
+            is_fixed[idx] = 1
+        else:
+            is_fixed[idx] = 0
 
 @ti.kernel
-def init_spring():
-    for i in range(N * N):
-        row = i // N
-        col = i % N
-        cnt = 0
-        # 右邻居
-        if col + 1 < N:
-            spring_neighbors[i, cnt] = row * N + col + 1
-            spring_rest_len[i, cnt] = 0.1
-            cnt += 1
-        # 下邻居
-        if row + 1 < N:
-            spring_neighbors[i, cnt] = (row + 1) * N + col
-            spring_rest_len[i, cnt] = 0.1
-            cnt += 1
-        # 左邻居
-        if col - 1 >= 0:
-            spring_neighbors[i, cnt] = row * N + col - 1
-            spring_rest_len[i, cnt] = 0.1
-            cnt += 1
-        # 上邻居
-        if row - 1 >= 0:
-            spring_neighbors[i, cnt] = (row - 1) * N + col
-            spring_rest_len[i, cnt] = 0.1
-            cnt += 1
-        # 无效邻居标记为-1
-        for j in range(cnt, 4):
-            spring_neighbors[i, j] = -1
+def init_springs():
+    for i, j in ti.ndrange(N, N):
+        idx = i * N + j
+        if i < N-1:
+            idx_r = (i+1)*N + j
+            c = ti.atomic_add(num_springs[None], 1)
+            spring_pairs[c] = ti.Vector([idx, idx_r])
+            spring_lengths[c] = (x[idx]-x[idx_r]).norm()
+        if j < N-1:
+            idx_d = i*N + (j+1)
+            c = ti.atomic_add(num_springs[None], 1)
+            spring_pairs[c] = ti.Vector([idx, idx_d])
+            spring_lengths[c] = (x[idx]-x[idx_d]).norm()
 
 @ti.kernel
-def init_line():
-    idx = 0
-    # 水平连线
-    for i in range(N):
-        for j in range(N - 1):
-            line_indices[idx] = i * N + j
-            line_indices[idx + 1] = i * N + j + 1
-            idx += 2
-    # 垂直连线
-    for j in range(N):
-        for i in range(N - 1):
-            line_indices[idx] = i * N + j
-            line_indices[idx + 1] = (i + 1) * N + j
-            idx += 2
+def init_spring_indices():
+    for i in range(num_springs[None]):
+        spring_indices[2*i] = spring_pairs[i][0]
+        spring_indices[2*i+1] = spring_pairs[i][1]
 
-# ====================== 任务2：力学计算 + 速度钳制（ti.func） ======================
+def init_cloth():
+    num_springs[None] = 0
+    init_positions()
+    init_springs()
+    init_spring_indices()
+
 @ti.func
-def compute_forces_on(i: ti.i32):
-    force = gravity * mass  # 重力
-    force += -k_d * v[i]    # 阻尼力
-    # 弹簧弹力（胡克定律）
-    for j in range(4):
-        n = spring_neighbors[i, j]
-        if n == -1:
-            continue
-        diff = x[i] - x[n]
-        dist = diff.norm()
+def compute_forces_on(pos, vel, force):
+    for i in range(N*N):
+        force[i] = gravity * mass - k_d * vel[i]
+    for i in range(num_springs[None]):
+        a = spring_pairs[i][0]
+        b = spring_pairs[i][1]
+        d = pos[a] - pos[b]
+        dist = d.norm()
         if dist > 1e-6:
-            rest = spring_rest_len[i, j]
-            force += -k_s * (dist - rest) * diff.normalized()
-    return force
+            dn = d / dist
+            fs = -k_s * (dist - spring_lengths[i]) * dn
+            ti.atomic_add(force[a], fs)
+            ti.atomic_add(force[b], -fs)
 
 @ti.func
-def clamp_velocity(vel):
-    res = vel
-    spd = vel.norm()
-    if spd > max_velocity:
-        res = vel / spd * max_velocity
-    return res
+def clamp_velocity(vel, idx):
+    norm = vel[idx].norm()
+    if norm > max_velocity:
+        vel[idx] = vel[idx] / norm * max_velocity
 
-# ====================== 任务3：三种积分器（独立Kernel） ======================
 @ti.kernel
 def step_explicit():
-    for i in range(N * N):
-        if is_fixed[i]:
-            continue
-        f = compute_forces_on(i)
-        a = f / mass
-        # 显式欧拉
-        v[i] += a * dt
-        v[i] = clamp_velocity(v[i])
-        x[i] += v[i] * dt
+    compute_forces_on(x, v, f)
+    for i in range(N*N):
+        if not is_fixed[i]:
+            x[i] += v[i] * dt
+            v[i] += f[i]/mass * dt
+            clamp_velocity(v, i)
 
 @ti.kernel
 def step_semi_implicit():
-    for i in range(N * N):
-        if is_fixed[i]:
-            continue
-        f = compute_forces_on(i)
-        a = f / mass
-        # 半隐式欧拉（先更新速度，再更新位置）
-        v[i] += a * dt
-        v[i] = clamp_velocity(v[i])
-        x[i] += v[i] * dt
+    compute_forces_on(x, v, f)
+    for i in range(N*N):
+        if not is_fixed[i]:
+            v[i] += f[i]/mass * dt
+            clamp_velocity(v, i)
+            x[i] += v[i] * dt
 
 @ti.kernel
 def step_implicit_iter():
-    # 初始化预测值
-    for i in range(N * N):
-        x_next[i] = x[i]
+    for i in range(N*N):
         v_next[i] = v[i]
-    # 定点迭代4次，和参考图隐式效果一致
-    for _ in range(4):
-        for i in range(N * N):
-            if is_fixed[i]:
-                continue
-            f = gravity * mass - k_d * v_next[i]
-            for j in range(4):
-                n = spring_neighbors[i, j]
-                if n == -1:
-                    continue
-                diff = x_next[i] - x_next[n]
-                dist = diff.norm()
-                if dist > 1e-6:
-                    rest = spring_rest_len[i, j]
-                    f += -k_s * (dist - rest) * diff.normalized()
-            a = f / mass
-            v_next[i] = v[i] + a * dt
-            v_next[i] = clamp_velocity(v_next[i])
-            x_next[i] = x[i] + v_next[i] * dt
-    # 回写最终状态
-    for i in range(N * N):
-        if not is_fixed[i]:
-            x[i] = x_next[i]
-            v[i] = v_next[i]
+        x_next[i] = x[i]
+    for _ in ti.static(range(3)):
+        compute_forces_on(x_next, v_next, f_next)
+        for i in range(N*N):
+            if not is_fixed[i]:
+                v_next[i] = v[i] + f_next[i]/mass * dt
+                clamp_velocity(v_next, i)
+                x_next[i] = x[i] + v_next[i] * dt
+    for i in range(N*N):
+        v[i] = v_next[i]
+        x[i] = x_next[i]
 
-# ====================== 渲染更新 ======================
-@ti.kernel
-def update_render_vertices(verts: ti.template()):
-    for i in range(N * N):
-        verts[i] = x[i]
-
-def reset_cloth():
-    init_particle_pos()
-    print("Cloth reset!")
-
-# ====================== 任务4：GGUI交互 + 渲染 ======================
-if __name__ == "__main__":
-    # 按顺序初始化，保证GPU状态同步
-    init_control()
-    init_particle_pos()
-    init_spring()
-    init_line()
-
-    window = ti.ui.Window("Games101 - Mass Spring System", (1024, 768))
+def main():
+    init_cloth()
+    window = ti.ui.Window("Mass Spring System", (800, 800))
     canvas = window.get_canvas()
-    gui = window.get_gui()
     scene = window.get_scene()
     camera = ti.ui.Camera()
-    # ✅ 相机视角和参考图完全一致
-    camera.position(1.0, 1.0, 5.0)
-    camera.lookat(1.0, 1.0, 0.0)
+    camera.position(0.0, 0.5, 2.0)
+    camera.lookat(0.0, 0.0, 0.0)
 
-    render_verts = ti.Vector.field(3, float, N * N)
+    method = 1
+    paused = False
 
     while window.running:
-        # ✅ 控制面板文字和参考图100%一致
-        with gui.sub_window("Control Panel", 0.04, 0.05, 0.28, 0.3):
-            gui.text("Integration Method:")
-            if gui.button("Explicit Euler (Explosive)"):
-                solver_type[None] = 0
-            if gui.button("Semi-Implicit Euler (Stable)"):
-                solver_type[None] = 1
-            if gui.button("Implicit Euler (Damped)"):
-                solver_type[None] = 2
+        window.GUI.begin("Control Panel", 0.02, 0.02, 0.38, 0.36)
+        window.GUI.text("Integration Method:")
 
-            gui.text("")
-            if gui.button("Pause Simulation"):
-                paused[None] = 1 - paused[None]
-            if gui.button("Reset Cloth"):
-                reset_cloth()
+        p0 = "[*] " if method ==0 else "[ ] "
+        p1 = "[*] " if method ==1 else "[ ] "
+        p2 = "[*] " if method ==2 else "[ ] "
 
-        # 物理模拟步进
-        if paused[None] == 0:
-            if solver_type[None] == 0:
-                step_explicit()
-            elif solver_type[None] == 1:
-                step_semi_implicit()
-            else:
-                step_implicit_iter()
+        if window.GUI.button(p0+"Explicit Euler (Explosive)"):
+            method = 0
+            init_cloth()
+        if window.GUI.button(p1+"Semi-Implicit Euler (Stable)"):
+            method = 1
+            init_cloth()
+        if window.GUI.button(p2+"Implicit Euler (Damped)"):
+            method = 2
+            init_cloth()
 
-        update_render_vertices(render_verts)
+        window.GUI.text("")
+        plabel = "Resume Simulation" if paused else "Pause Simulation"
+        if window.GUI.button(plabel):
+            paused = not paused
+        if window.GUI.button("Reset Cloth"):
+            init_cloth()
+        window.GUI.end()
 
-        # 渲染场景
+        if not paused:
+            for _ in range(40):
+                if method ==0:
+                    step_explicit()
+                elif method ==1:
+                    step_semi_implicit()
+                elif method ==2:
+                    step_implicit_iter()
+
         scene.set_camera(camera)
-        scene.ambient_light((0.2, 0.2, 0.2))
-        scene.point_light((5.0, 8.0, 5.0), (1.0, 1.0, 1.0))
-
-        # ✅ 渲染：和参考图完全一致（先画线，再画点）
-        scene.lines(render_verts, indices=line_indices, width=0.01, color=(1.0, 1.0, 1.0))
-        scene.particles(render_verts, radius=0.025, color=(0.2, 0.6, 1.0))
-
+        scene.ambient_light((0.5,0.5,0.5))
+        scene.point_light((0.5,1.5,1.5),(1,1,1))
+        scene.particles(x,0.015,(0.2,0.6,1.0))
+        scene.lines(x,indices=spring_indices,width=1.5,color=(0.8,0.8,0.8))
         canvas.scene(scene)
         window.show()
+
+if __name__ == '__main__':
+    main()
