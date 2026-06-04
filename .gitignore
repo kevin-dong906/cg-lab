@@ -1,2 +1,1 @@
-New-Item .gitignore -ItemType File
-notepad .gitignore
+
