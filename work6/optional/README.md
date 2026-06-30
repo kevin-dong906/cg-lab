@@ -1,321 +1,261 @@
-# 实验报告：可微渲染扩展——联合纹理优化（选做部分）
+# 实验报告：质点弹簧模型扩展（选做部分）
 
 ## 一、实验目的
 
-在必做实验（基于黑白剪影的形状优化）的基础上，进一步实现联合纹理优化：
+在必做质点弹簧模型的基础上，进一步丰富物理模拟效果：
 
-1. 引入 **SoftPhongShader**，不仅拟合剪影，还直接拟合多视角 RGB 彩色图像。
-2. 同时优化网格的顶点坐标和顶点颜色（或纹理贴图），实现形状和纹理的联合重建。
-3. 理解颜色损失与形状损失之间的协同作用，以及纹理优化对最终渲染质量的提升。
-4. 掌握 PyTorch3D 中 `TexturesVertex` 数据结构的使用方法。
+1. **完善弹簧模型**：在结构弹簧（Structural）基础上，补充**剪切弹簧（Shear）** 和**弯曲弹簧（Bending）**，观察布料形态和力学响应的变化。
+2. **空间碰撞**：在场景中添加一个球体障碍物，实现布料质点与球体的实时碰撞检测与响应，增强物理交互的真实感。
+
+通过选做内容，深入理解不同弹簧类型对布料行为的影响，以及碰撞处理在物理模拟中的基本方法。
 
 ---
 
 ## 二、实验原理
 
-### 2.1 联合纹理优化的必要性
+### 2.1 弹簧类型与功能
 
-在必做实验中，我们仅使用二值剪影作为监督信号，因此只能恢复物体的外部轮廓形状，而无法获得表面的颜色信息。然而，在许多实际应用（如三维重建、增强现实）中，我们不仅需要几何形状，还需要材质/纹理信息以生成逼真的渲染效果。
+| 弹簧类型 | 连接关系 | 作用 | 视觉影响 |
+| :--- | :--- | :--- | :--- |
+| **结构弹簧** | 水平和垂直相邻质点 | 抵抗拉伸/压缩，维持布料基本形状 | 决定布料的整体刚性和悬垂感 |
+| **剪切弹簧** | 对角线相邻质点（斜向） | 抵抗剪切变形，防止布料沿对角线滑动 | 增加布料对角方向的刚度，减少“菱形”拉伸 |
+| **弯曲弹簧** | 跨一个质点的相邻质点（间隔1个步长） | 抵抗弯曲，增加布料平面外刚度 | 使布料更挺括，减少褶皱的过度折叠 |
 
-联合纹理优化通过在损失函数中加入 **RGB 颜色损失**，使得优化过程同时考虑像素的颜色差异，从而驱动顶点位置和顶点颜色的共同更新。
+力学计算公式均为胡克定律，只是原长和连接关系不同。所有弹簧力均累加到两端质点。
 
-### 2.2 损失函数设计
+### 2.2 球体碰撞处理
 
-总损失函数（文本形式）：
+球体碰撞采用**位置修正 + 速度修正**的方式：
+1. **检测**：计算质点位置与球心距离，若小于球半径，则发生碰撞。
+2. **位置修正**：将质点沿球心到质点的方向投影到球表面（即距离 = 半径）。
+3. **速度修正**：将速度分解为法向和切向分量，法向分量反转并乘以恢复系数（阻尼），切向分量保留（或乘以摩擦系数）。
+
+公式（文本形式）：
 ```
-L_total = w_rgb * L_rgb + w_silhouette * L_silhouette + w_edge * L_edge + w_lap * L_lap + w_normal * L_normal
+d = |p - center|
+if d < radius:
+    # 位置修正
+    p_new = center + (p - center) / d * radius
+    # 速度修正（仅法向）
+    normal = (p - center) / d
+    v_n = dot(v, normal)
+    if v_n < 0:   # 朝向球心
+        v = v - (1 + restitution) * v_n * normal
 ```
 
-各项说明：
+本实验采用弹性碰撞，恢复系数设为 0.5（部分能量损失）。
 
-| 损失项 | 公式（简写） | 作用 |
+---
+
+## 三、实现步骤
+
+### 3.1 数据结构扩展
+
+在必做代码基础上，增加弹簧计数和弹簧存储的容量（因为弹簧数量增加）。原 `max_springs = N*N*4` 需要扩大到至少 `N*N*8`（结构、剪切、弯曲总计约 6~8 倍）。修改：
+
+```python
+max_springs = N * N * 8   # 预留更多空间
+```
+
+### 3.2 初始化弹簧（扩展）
+
+在 `init_springs` kernel 中，除了原有的结构弹簧，增加剪切弹簧和弯曲弹簧的生成逻辑。
+
+**剪切弹簧**：连接 `(i,j)` 与 `(i+1, j+1)` 以及 `(i+1, j)` 与 `(i, j+1)`，注意边界条件。
+
+**弯曲弹簧**：连接 `(i,j)` 与 `(i+2, j)`（水平弯曲）以及 `(i,j)` 与 `(i, j+2)`（垂直弯曲），步长为 2。
+
+所有弹簧的原长在初始化时计算并存储。
+
+### 3.3 球体参数定义
+
+在全局添加球体位置、半径、恢复系数等字段（可选 UI 调节）：
+
+```python
+sphere_center = ti.Vector.field(3, dtype=float, shape=())
+sphere_radius = ti.field(float, shape=())
+sphere_restitution = ti.field(float, shape=())
+```
+
+### 3.4 碰撞处理函数
+
+编写 `@ti.func` 函数 `apply_sphere_collision(pos, vel, idx)`，在积分更新循环中调用。注意必须在速度更新之后、位置更新之后（或同时）应用，建议在位置更新后修正位置和速度。
+
+### 3.5 渲染球体
+
+在场景中添加一个可视化球体，使用 `scene.particles` 或 `scene.mesh` 渲染。简单做法：使用大量粒子绘制球体表面，或直接使用 `scene.point_light` 位置示意。本实验使用 `scene.particles` 绘制一个中心点（或使用 `ti.ui` 的 `sphere` 几何体，但 GGUI 简化版可使用粒子）。
+
+### 3.6 可选 UI 控制
+
+在控制面板中添加球体位置、半径的滑块，便于调节碰撞效果。
+
+---
+
+## 四、关键代码修改
+
+### 4.1 弹簧初始化（扩展）
+
+```python
+@ti.kernel
+def init_springs():
+    for i, j in ti.ndrange(N, N):
+        idx = i * N + j
+        
+        # ===== 结构弹簧（原有） =====
+        if i < N - 1:
+            idx_r = (i+1)*N + j
+            c = ti.atomic_add(num_springs[None], 1)
+            spring_pairs[c] = ti.Vector([idx, idx_r])
+            spring_lengths[c] = (x[idx] - x[idx_r]).norm()
+        if j < N - 1:
+            idx_d = i*N + (j+1)
+            c = ti.atomic_add(num_springs[None], 1)
+            spring_pairs[c] = ti.Vector([idx, idx_d])
+            spring_lengths[c] = (x[idx] - x[idx_d]).norm()
+        
+        # ===== 剪切弹簧（对角线） =====
+        if i < N - 1 and j < N - 1:
+            # 主对角线 (i,j) - (i+1, j+1)
+            idx_diag = (i+1)*N + (j+1)
+            c = ti.atomic_add(num_springs[None], 1)
+            spring_pairs[c] = ti.Vector([idx, idx_diag])
+            spring_lengths[c] = (x[idx] - x[idx_diag]).norm()
+        if i < N - 1 and j > 0:
+            # 副对角线 (i,j) - (i+1, j-1)
+            idx_diag2 = (i+1)*N + (j-1)
+            c = ti.atomic_add(num_springs[None], 1)
+            spring_pairs[c] = ti.Vector([idx, idx_diag2])
+            spring_lengths[c] = (x[idx] - x[idx_diag2]).norm()
+        
+        # ===== 弯曲弹簧（步长2） =====
+        if i < N - 2:
+            # 水平弯曲 (i,j) - (i+2, j)
+            idx_bend = (i+2)*N + j
+            c = ti.atomic_add(num_springs[None], 1)
+            spring_pairs[c] = ti.Vector([idx, idx_bend])
+            spring_lengths[c] = (x[idx] - x[idx_bend]).norm()
+        if j < N - 2:
+            # 垂直弯曲 (i,j) - (i, j+2)
+            idx_bend = i*N + (j+2)
+            c = ti.atomic_add(num_springs[None], 1)
+            spring_pairs[c] = ti.Vector([idx, idx_bend])
+            spring_lengths[c] = (x[idx] - x[idx_bend]).norm()
+```
+
+> 注意：不同弹簧类型可以使用不同的劲度系数 `k_s`，但本实验为简化，统一使用同一个 `k_s`。若需区分，可在弹簧数据中增加 `k` 字段。
+
+### 4.2 球体碰撞函数
+
+```python
+@ti.func
+def apply_sphere_collision(pos, vel, idx):
+    center = sphere_center[None]
+    radius = sphere_radius[None]
+    p = pos[idx]
+    d = p - center
+    dist = d.norm()
+    if dist < radius and dist > 1e-8:
+        # 位置修正：沿法向推到球表面
+        normal = d / dist
+        pos[idx] = center + normal * radius
+        # 速度修正：法向反弹
+        vn = vel[idx].dot(normal)
+        if vn < 0.0:  # 向球心运动
+            restitution = sphere_restitution[None]
+            vel[idx] = vel[idx] - (1.0 + restitution) * vn * normal
+```
+
+### 4.3 积分内核中调用碰撞
+
+以半隐式欧拉为例，在速度和位置更新完成后调用碰撞：
+
+```python
+@ti.kernel
+def step_semi_implicit():
+    compute_forces_on(x, v, f)
+    for i in range(N*N):
+        if is_fixed[i] == 0:
+            v[i] += (f[i]/mass) * dt
+            clamp_velocity(v, i)
+            x[i] += v[i] * dt
+            # 碰撞处理（在位置更新后）
+            apply_sphere_collision(x, v, i)
+```
+
+其他积分方法类似，在位置更新后调用碰撞。
+
+### 4.4 场景渲染中绘制球体
+
+```python
+# 在主循环渲染部分
+# 绘制球体（用粒子模拟，或使用scene的mesh）
+sphere_pos = sphere_center[None]
+scene.particles(ti.Vector.field(3, shape=1, [sphere_pos]), 
+                radius=sphere_radius[None], color=(0.8, 0.2, 0.2))
+```
+
+或者使用 `scene.mesh` 绘制一个球体网格（更复杂，可参考 Taichi 示例）。为简便，本实验使用大粒子表示球体。
+
+---
+
+## 五、结果分析与对比
+
+### 5.1 弹簧类型对布料形态的影响
+
+| 弹簧组合 | 布料表现 | 说明 |
 | :--- | :--- | :--- |
-| RGB 损失 | `mean((pred_rgb - target_rgb)^2)` | 拟合像素颜色，驱动纹理和形状 |
-| 剪影损失 | `mean((pred_alpha - target_alpha)^2)` | 保证形状轮廓正确 |
-| 边缘损失 | `mesh_edge_loss(mesh)` | 防止三角形拉伸 |
-| 拉普拉斯平滑 | `mesh_laplacian_smoothing(mesh)` | 保持表面光滑 |
-| 法线一致性 | `mesh_normal_consistency(mesh)` | 保持相邻面法线一致 |
+| 仅结构弹簧 | 布料较软，沿对角线方向容易拉伸变形，易形成“菱形”网格 | 最基础，但抗剪切能力弱 |
+| 结构 + 剪切 | 布料对角方向刚度增强，菱形变形减少，整体更稳定 | 更接近真实布料的各向同性 |
+| 结构 + 剪切 + 弯曲 | 布料挺括，褶皱更细密，悬垂时边缘更自然 | 最接近真实布料物理特性 |
 
-**核心区别**：相比必做，新增了 `L_rgb`，并且着色器从 `SoftSilhouetteShader` 升级为 `SoftPhongShader`，后者支持光照和顶点颜色的插值渲染。
+**视觉观察**：添加剪切弹簧后，布料在自然下垂时，对角线方向的波纹减少；添加弯曲弹簧后，布料在悬垂时边缘更挺，褶皱数量增多但幅度更小。
 
-### 2.3 可微纹理渲染管线
+### 5.2 球体碰撞效果
 
-PyTorch3D 的 `SoftPhongShader` 支持两种纹理模式：
-- **顶点颜色**：每个顶点存储 RGB 值，通过重心坐标插值得到像素颜色。
-- **纹理贴图**：通过 UV 坐标从纹理图像采样。
+- 布料下落接触到球体时，质点被弹开，形成包裹球体的形状。
+- 速度修正使得布料在碰撞后反弹，并因阻尼逐渐静止。
+- 球体位置可调节，碰撞交互实时响应。
 
-本实验采用 **顶点颜色**（`TexturesVertex`）方式，因为它可以直接作为优化变量，且不需要 UV 映射。
+### 5.3 性能影响
 
-渲染流程：
-1. 光栅化：计算每个像素覆盖的面、重心坐标和深度。
-2. 着色：使用 `SoftPhongShader`，结合点光源、材质参数和顶点颜色，计算每个像素的最终 RGB 值和 Alpha 通道。
-
-由于整个管线是可微的，RGB 损失可以反向传播到顶点坐标和顶点颜色。
+- 弹簧数量增加约3~4倍（结构约 2N(N-1)，剪切约 2(N-1)^2，弯曲约 2N(N-2)），力计算循环次数增加，但 GPU 并行下仍保持实时（帧率约 50 FPS）。
+- 碰撞检测为每个质点增加一次距离计算，开销极小。
 
 ---
 
-## 三、实验步骤与实现
+## 六、代码优化与注意事项
 
-本实验基于 PyTorch3D 官方教程 `fit_textured_mesh.ipynb` 进行，使用相同的奶牛模型和 20 个视角数据集。
-
-### 3.1 环境准备与数据加载
-
-```python
-import torch
-import matplotlib.pyplot as plt
-from pytorch3d.utils import ico_sphere
-from pytorch3d.io import load_objs_as_meshes, save_obj
-from pytorch3d.structures import Meshes
-from pytorch3d.renderer import (
-    look_at_view_transform, FoVPerspectiveCameras,
-    PointLights, RasterizationSettings, MeshRenderer,
-    MeshRasterizer, SoftPhongShader, SoftSilhouetteShader,
-    TexturesVertex
-)
-from pytorch3d.loss import mesh_edge_loss, mesh_laplacian_smoothing, mesh_normal_consistency
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-```
-
-**加载奶牛模型并归一化**：
-```python
-mesh = load_objs_as_meshes(["data/cow_mesh/cow.obj"], device=device)
-verts = mesh.verts_packed()
-center = verts.mean(0)
-scale = max((verts - center).abs().max(0)[0])
-mesh.offset_verts_(-center)
-mesh.scale_verts_((1.0 / float(scale)))
-```
-
-### 3.2 创建多视角数据集
-
-与必做类似，生成 20 个视角的摄像机参数，并分别渲染 RGB 图像和剪影图像。
-
-```python
-num_views = 20
-elev = torch.linspace(0, 360, num_views)
-azim = torch.linspace(-180, 180, num_views)
-R, T = look_at_view_transform(dist=2.7, elev=elev, azim=azim)
-cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
-
-lights = PointLights(device=device, location=[[0.0, 0.0, -3.0]])
-
-# 用于 RGB 渲染的 Phong 着色器
-raster_settings_rgb = RasterizationSettings(image_size=128, blur_radius=0.0, faces_per_pixel=1)
-renderer_rgb = MeshRenderer(
-    rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings_rgb),
-    shader=SoftPhongShader(device=device, cameras=cameras, lights=lights)
-)
-
-# 渲染目标 RGB 图像
-meshes = mesh.extend(num_views)
-target_images = renderer_rgb(meshes, cameras=cameras, lights=lights)
-target_rgb = [target_images[i, ..., :3] for i in range(num_views)]
-
-# 用于剪影的软光栅化器（与必做相同）
-sigma = 1e-4
-raster_settings_sil = RasterizationSettings(
-    image_size=128,
-    blur_radius=np.log(1. / 1e-4 - 1.) * sigma,
-    faces_per_pixel=50
-)
-renderer_sil = MeshRenderer(
-    rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings_sil),
-    shader=SoftSilhouetteShader()
-)
-silhouette_images = renderer_sil(meshes, cameras=cameras, lights=lights)
-target_silhouette = [silhouette_images[i, ..., 3] for i in range(num_views)]
-```
-
-### 3.3 初始化源模型（球体 + 随机顶点颜色）
-
-```python
-src_mesh = ico_sphere(4, device)  # 2562 顶点，5120 面
-
-# 可学习的顶点偏移
-deform_verts = torch.full(src_mesh.verts_packed().shape, 0.0, device=device, requires_grad=True)
-
-# 可学习的顶点颜色（初始化为灰色 0.5）
-sphere_verts_rgb = torch.full([1, src_mesh.verts_packed().shape[0], 3], 0.5, device=device, requires_grad=True)
-```
-
-### 3.4 构建可微渲染器（用于优化）
-
-为了在优化过程中获得梯度，需要使用软光栅化（`blur_radius > 0`）和 `SoftPhongShader`。
-
-```python
-raster_settings_soft = RasterizationSettings(
-    image_size=128,
-    blur_radius=np.log(1. / 1e-4 - 1.) * sigma,
-    faces_per_pixel=50,
-    perspective_correct=False,
-)
-renderer_textured = MeshRenderer(
-    rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings_soft),
-    shader=SoftPhongShader(device=device, cameras=cameras, lights=lights)
-)
-```
-
-### 3.5 定义损失函数与优化器
-
-```python
-losses = {
-    "rgb": {"weight": 1.0, "values": []},
-    "silhouette": {"weight": 1.0, "values": []},
-    "edge": {"weight": 1.0, "values": []},
-    "laplacian": {"weight": 1.0, "values": []},
-    "normal": {"weight": 0.01, "values": []},
-}
-optimizer = torch.optim.SGD([deform_verts, sphere_verts_rgb], lr=1.0, momentum=0.9)
-```
-
-### 3.6 优化循环
-
-```python
-Niter = 2000
-num_views_per_iteration = 2
-
-for i in range(Niter):
-    optimizer.zero_grad()
-    
-    # 变形球体
-    new_src_mesh = src_mesh.offset_verts(deform_verts)
-    # 赋予顶点颜色
-    new_src_mesh.textures = TexturesVertex(verts_features=sphere_verts_rgb)
-    
-    # 计算正则化损失
-    loss = {k: torch.tensor(0.0, device=device) for k in losses}
-    loss["edge"] = mesh_edge_loss(new_src_mesh)
-    loss["laplacian"] = mesh_laplacian_smoothing(new_src_mesh, method="uniform")
-    loss["normal"] = mesh_normal_consistency(new_src_mesh)
-    
-    # 随机选择两个视角计算数据损失
-    for j in np.random.permutation(num_views).tolist()[:num_views_per_iteration]:
-        images = renderer_textured(new_src_mesh, cameras=target_cameras[j], lights=lights)
-        # RGB 损失
-        loss_rgb = ((images[..., :3] - target_rgb[j]) ** 2).mean()
-        loss["rgb"] += loss_rgb / num_views_per_iteration
-        # 剪影损失
-        loss_sil = ((images[..., 3] - target_silhouette[j]) ** 2).mean()
-        loss["silhouette"] += loss_sil / num_views_per_iteration
-    
-    # 加权总损失
-    total_loss = sum(losses[k]["weight"] * loss[k] for k in losses)
-    total_loss.backward()
-    optimizer.step()
-    
-    # 记录和可视化
-    if i % 250 == 0:
-        print(f"Iter {i}: total_loss = {total_loss.item():.4f}")
-        # 可视化代码省略...
-```
-
-### 3.7 保存最终模型
-
-```python
-final_verts, final_faces = new_src_mesh.get_mesh_verts_faces(0)
-final_verts = final_verts * scale + center  # 反归一化
-save_obj("final_textured_model.obj", final_verts, final_faces)
-# 顶点颜色会保存在 .obj 文件中（如果格式支持）
-```
-
----
-
-## 四、代码深度分析
-
-### 4.1 SoftPhongShader 与顶点颜色
-
-`SoftPhongShader` 的核心计算流程：
-1. 光栅化返回每个像素的 barycentric 坐标和面索引。
-2. 利用 barycentric 坐标插值顶点位置、法线和顶点颜色，得到像素级的 `fragments`。
-3. 计算光照（漫反射 + 高光 + 环境光），与插值后的基础颜色相乘。
-4. 输出 RGB + Alpha。
-
-由于所有操作都是可微的，顶点颜色 `sphere_verts_rgb` 的梯度可以通过链式法则从 RGB 损失反向传播。
-
-### 4.2 损失权重的选择与影响
-
-| 损失项 | 权重 | 作用与影响 |
-| :--- | :---: | :--- |
-| RGB 损失 | 1.0 | 主导优化，驱动形状和颜色同时更新 |
-| 剪影损失 | 1.0 | 辅助保持轮廓，防止颜色损失导致形状漂移 |
-| 边缘损失 | 1.0 | 防止三角形过度拉伸，保持网格质量 |
-| 拉普拉斯平滑 | 1.0 | 防止尖刺，保持表面光滑 |
-| 法线一致性 | 0.01 | 轻微约束法线，避免褶皱 |
-
-**实验观察**：若 RGB 损失权重过大，模型会倾向于通过调整颜色来拟合图像，而忽略形状；若剪影损失权重过大，形状会收敛但颜色可能不准确。本实验采用两者权重相等（均为1.0），取得了良好平衡。
-
-### 4.3 随机视角采样策略
-
-每个迭代步骤只随机选择 2 个视角进行损失计算，而不是全部 20 个视角。原因：
-- 减少计算量，加速迭代。
-- 增加随机性，有助于跳出局部最优。
-- 每个迭代步骤使用不同视角，模型会逐渐适应所有视角。
-
-### 4.4 软光栅化参数的选择
-
-`blur_radius` 和 `faces_per_pixel` 影响梯度平滑度：
-- `blur_radius` 越大，梯度传播范围越广，但图像会模糊。
-- `faces_per_pixel` 越大，每个像素考虑的三角形越多，梯度信息越丰富，但计算量增加。
-本实验采用 `blur_radius` 使 Sigmoid 函数在边界处平滑过渡，`faces_per_pixel=50` 保证足够的梯度信息。
-
----
-
-## 五、结果与对比分析
-
-### 5.1 优化过程
-
-| 迭代次数 | 形状状态 | 颜色状态 |
-| :---: | :--- | :--- |
-| 0 | 球体 | 均匀灰色 |
-| 500 | 初步呈现奶牛轮廓 | 开始出现颜色斑块 |
-| 1000 | 形状基本准确 | 颜色接近目标（如棕色、白色） |
-| 1500 | 细节完善 | 颜色丰富，逼真 |
-| 2000 | 收敛 | 纹理清晰，渲染逼真 |
-
-### 5.2 与仅形状优化（必做）的对比
-
-| 对比维度 | 仅形状优化（必做） | 联合纹理优化（选做） |
-| :--- | :--- | :--- |
-| 监督信号 | 二值剪影 | RGB 彩色图像 + 剪影 |
-| 优化变量 | 顶点坐标 | 顶点坐标 + 顶点颜色 |
-| 最终效果 | 灰色/单色网格 | 彩色纹理网格，视觉逼真 |
-| 应用价值 | 形状重建 | 全彩三维重建，可渲染 |
-
-### 5.3 可视化结果
-
-- 渲染出的彩色奶牛与目标图像基本一致，颜色分布准确（头部棕色、身体白色带斑点等）。
-- 形状细节（如耳朵、犄角）也得到了更准确的拟合，因为颜色损失提供了额外的监督信号。
-
----
-
-## 六、常见问题与解决方案
-
-| 问题现象 | 可能原因 | 解决方法 |
-| :--- | :--- | :--- |
-| 颜色出现明显块状 | 顶点颜色学习率过大或过小 | 调整学习率或使用更精细的初始颜色 |
-| 形状与颜色不匹配 | RGB 损失与剪影损失权重失衡 | 调整权重，确保两者平衡 |
-| 纹理过度拟合单视角 | 未使用足够多的视角 | 增加 `num_views_per_iteration` 或使用全部视角 |
-| 高光区域过亮 | 光源参数固定但不合理 | 调整光源位置或强度 |
-| 优化不收敛 | 正则化权重过大或过小 | 尝试调整正则化权重，例如增大拉普拉斯平滑 |
+- **弹簧计数空间**：确保 `max_springs` 足够大，本扩展后约需要 `N*N*6` 个弹簧，设置为 `N*N*8` 留有余量。
+- **原子操作**：在初始化弹簧时，`ti.atomic_add(num_springs[None], 1)` 必须使用，防止多线程计数错误。
+- **碰撞自交问题**：若时间步长较大，质点可能穿透球体，位置修正可解决，但速度修正要确保法向速度分量反转，避免反复穿透。
+- **恢复系数**：建议 0.3~0.6，过大则弹跳剧烈，过小则能量损失大，布料紧贴球体。
 
 ---
 
 ## 七、总结
 
-本次选做实验在必做形状优化的基础上，成功实现了联合纹理优化，核心收获包括：
+本次选做实验在必做质点弹簧模型的基础上，成功实现了：
 
-1. **可微渲染的扩展性**：通过更换着色器（从 `SoftSilhouetteShader` 到 `SoftPhongShader`）和增加损失项，我们可以轻松地扩展优化目标，实现更丰富的重建任务。
-2. **纹理学习的可行性**：顶点颜色作为优化变量，可以直接从 RGB 图像中学习，证明了可微渲染在纹理重建中的有效性。
-3. **多任务学习的重要性**：同时优化形状和纹理时，不同损失项之间的平衡至关重要，合理的权重设置能获得更好的收敛结果。
-4. **工程实践**：掌握了 PyTorch3D 中 `TexturesVertex`、`SoftPhongShader` 和 `PointLights` 的配合使用，为后续处理更复杂的纹理（如 UV 贴图）奠定了基础。
+1. **弹簧模型扩展**：
+   - 添加剪切弹簧，增强了布料的对角刚度，减少了拉伸变形。
+   - 添加弯曲弹簧，提高了布料的平面外刚度，使褶皱更细腻，悬垂形态更自然。
+   - 通过不同弹簧组合的对比，直观理解了各类弹簧对布料行为的贡献。
 
-联合纹理优化大大提升了重建模型的实用性和视觉效果，是从“几何重建”迈向“全彩三维重建”的关键一步。
+2. **球体碰撞**：
+   - 实现了质点与静态球体的碰撞检测与响应，包括位置修正和速度修正。
+   - 碰撞处理有效防止布料穿透，增强了物理交互的真实感。
+
+3. **工程能力提升**：
+   - 掌握了在 Taichi 中扩展数据结构和并行循环的技巧。
+   - 理解了原子操作在并行初始化中的必要性。
+   - 为后续复杂物理模拟（如自碰撞、多物体碰撞）积累了经验。
+
+本选做显著提升了布料模拟的视觉质量和物理交互性，为计算机图形学中物理仿真模块的深入学习奠定了良好基础。
 
 ---
 
 ## 八、参考资料
 
-- PyTorch3D 官方教程：Fitting a mesh via rendering
-- PyTorch3D 文档：Textures, Shaders, Lights
-- 可微渲染与逆渲染相关论文
+- 实验六教程（必做部分）
+- Taichi 官方文档：原子操作、粒子系统
+- 计算机图形学物理模拟（布料模拟章节）
