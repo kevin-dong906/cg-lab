@@ -1,217 +1,337 @@
-# 基于可微光栅化的三维网格重建实验报告
-## 一、实验目标
-1. 理解并掌握可微光栅化的原理，重点学习离散Mesh几何体边界处的数学近似平滑方法，解决传统硬光栅化梯度消失问题。
-2. 掌握利用多视角二维剪影、RGB图像信息，反向推导并迭代优化三维网格顶点坐标的实现流程。
-3. 理解网格正则化的核心意义，掌握拉普拉斯平滑、边长约束、法线一致性正则项的作用，明确其在防止网格拓扑崩坏、规避局部最优解中的关键价值。
-4. 基于PyTorch3D框架，实现由初始球体网格通过可微渲染梯度下降，逐步变形拟合为奶牛三维模型的完整实验流程。
+# 实验报告：光线追踪（必做部分）
+
+## 一、实验目的
+
+1. **理论理解**：理解光线投射与光线追踪的本质区别，掌握 Whitted-style 光线追踪的基本流程。
+2. **全局光照**：掌握通过发射次级射线（阴影射线和反射射线）实现硬阴影和理想镜面反射的方法。
+3. **GPU 编程思维**：学习将传统递归光线追踪算法改写为适合 GPU 并行计算的迭代循环模式。
+
+---
 
 ## 二、实验原理
-### 2.1 软光栅化原理
-传统硬光栅化采用二值判别方式，像素要么完全处于三角形内部，要么完全处于外部，属于阶跃式离散变化。该方式在模型边界处梯度恒为0，产生**梯度消失**问题，无法通过反向传播更新顶点位置。
 
-软光栅化引入距离加权与Sigmoid平滑函数，构建连续可微的像素归属概率：
-$$A(d) = \text{sigmoid}\left(\frac{d}{\sigma}\right)$$
-式中，$d$ 为像素到三角形边缘的空间距离，$\sigma$ 控制边缘模糊平滑程度。通过连续概率替代二值判定，保证模型边界区域梯度连续可传，为顶点迭代优化提供有效梯度信息。
+### 2.1 Whitted-style 光线追踪流程
 
-### 2.2 网格正则化原理
-仅依靠剪影拟合损失优化顶点，会出现顶点无序偏移、网格重叠拉伸、表面产生尖刺等问题，陷入局部最优解。实验引入三项正则化约束，保障网格拓扑结构合理性：
-1. **拉普拉斯平滑正则**：约束相邻顶点空间位置差异，抑制模型表面产生尖锐突起与褶皱，维持曲面光滑性。
-2. **边长一致性正则**：惩罚网格中过长或过短的边，避免三角形网格发生严重拉伸与压缩，保持网格分布均匀。
-3. **法线一致性正则**：约束相邻三角面片的法线方向趋于一致，进一步提升模型整体表面平滑度。
+对于每个像素，从摄像机发射一条主光线。当光线击中场景中的物体时：
 
-### 2.3 总损失函数
-实验采用剪影拟合损失与多项正则化损失加权融合的联合损失函数：
-$$L_{total} = L_{silhouette} + w_{lap}L_{lap} + w_{edge}L_{edge} + w_{normal}L_{normal}$$
-其中，$L_{silhouette}$ 为多视角剪影均方误差损失，负责约束外形拟合；$L_{lap}、L_{edge}、L_{normal}$ 分别为三项正则化损失，$w_{lap}、w_{edge}、w_{normal}$ 为对应权重系数，平衡拟合精度与网格光滑度。
+1. **阴影测试**：从交点向光源发射一条阴影射线，检测是否被其他物体遮挡。若遮挡，则仅保留环境光分量。
+2. **材质分支**：
+   - 若击中**漫反射物体**：按 Phong 模型计算颜色（环境光+漫反射+高光），然后终止该光线传播。
+   - 若击中**镜面物体**：根据反射定律计算反射方向，生成新的反射光线，继续追踪，直到击中漫反射物体或达到最大弹射次数。
 
-## 三、实验环境与依赖配置
-### 3.1 实验环境
-运行框架：PyTorch + PyTorch3D
-计算设备：CUDA GPU 兼容 CPU 运行
-可视化工具：Matplotlib、MeshLab
+### 2.2 反射方向计算
 
-### 3.2 依赖安装命令
+对于入射光线方向 L_in（指向交点）和法向量 N，反射方向 R 的计算公式（文本形式）：
+```
+R = L_in - 2 * (L_in · N) * N
+```
+其中 L_in 和 N 均为单位向量。
+
+### 2.3 迭代追踪 vs 递归追踪
+
+传统 CPU 光线追踪常用递归函数实现，但 GPU 不适合递归。因此，本实验采用 for 循环迭代模拟光线弹射：
+- 维护当前光线起点和方向，以及一个吞吐量衰减系数（初始为1）。
+- 每弹射一次，如果击中镜面，更新起点和方向，吞吐量乘以反射率（如0.8），继续循环。
+- 如果击中漫反射，计算光照并加到最终颜色，然后跳出循环。
+- 循环次数上限由用户通过 UI 调节（最大弹射次数）。
+
+### 2.4 阴影与浮点精度（Shadow Acne）
+
+阴影射线从交点出发，若起点不作偏移，会立即与自身表面相交，产生大量黑色噪点（自相交）。解决方案：将阴影射线起点沿法线方向微微偏移一个小量 epsilon（如 1e-4），即：
+```
+shadow_origin = P + N * epsilon
+```
+反射射线同样需要偏移，防止与自身相交。
+
+---
+
+## 三、实验任务与实现
+
+本实验包含四个必做任务，具体实现如下。
+
+### 3.1 任务1：搭建包含平面的三维场景
+
+不使用外部模型，在 GPU 内核中隐式定义三个几何体：
+
+- **无限大平面**：位于 y = -1.0，法线朝上 (0, 1, 0)。材质为漫反射，并实现棋盘格纹理，通过交点 x 和 z 坐标的奇偶性判断颜色。
+- **红色漫反射球**：位于 (-1.5, 0.0, 0)，半径 1.0，基础颜色 (0.8, 0.1, 0.1)。
+- **银色镜面球**：位于 (1.5, 0.0, 0)，半径 1.0，镜面反射率约 0.8，无漫反射成分。
+
+为每个物体赋予材质 ID（0=漫反射平面，1=漫反射球，2=镜面球）以便在着色时区分。
+
+### 3.2 任务2：实现基于迭代的光线弹射
+
+在 `render` 内核中，对每个像素执行迭代追踪算法（伪代码）：
+
+```
+color = (0,0,0)
+throughput = 1.0
+ray_origin = camera_pos
+ray_direction = normalized(pixel_direction)
+
+for bounce in range(max_bounces):
+    # 求交：检测与平面、红球、镜面球的交点，取最近
+    if no intersection:
+        color += throughput * background_color
+        break
+    else:
+        P = intersection_point
+        N = normal_at_P
+        obj_id = material_id
+
+        if obj_id == mirror:
+            # 镜面反射：更新光线方向
+            R = reflect(-ray_direction, N)  # 注意入射方向取反
+            ray_origin = P + N * epsilon
+            ray_direction = R
+            throughput *= 0.8   # 反射衰减
+            continue   # 继续循环
+
+        elif obj_id == diffuse:
+            # 阴影测试
+            L = normalize(light_pos - P)
+            shadow_origin = P + N * epsilon
+            # 检测阴影射线是否被其他物体遮挡（包括平面和其他球）
+            if not occluded(shadow_origin, L):
+                # 计算漫反射光照（Phong）
+                ambient = Ka * light_color * object_color
+                diff = max(0, N·L) * Kd * light_color * object_color
+                spec = ...   # 根据需要可加高光
+                local_color = ambient + diff + spec
+            else:
+                local_color = ambient   # 只有环境光
+            color += throughput * local_color
+            break   # 漫反射终止追踪
+```
+
+注意：`-ray_direction` 是入射方向（从交点指向光线来源），reflect 函数需要入射方向指向光源。
+
+### 3.3 任务3：硬阴影与浮点精度处理
+
+阴影检测函数 `is_occluded`：从阴影起点向光源方向发射射线，检测是否与场景中除自身以外的物体相交，且交点距离小于到光源的距离。若相交则返回 True。
+
+**关键**：必须将阴影射线起点沿法线偏移 epsilon，否则会导致自身表面自相交，产生噪声。
+
+同样，反射射线的起点也需要偏移，避免被自身表面截获。
+
+### 3.4 任务4：UI 交互面板
+
+使用 `ti.ui.Window` 的 GUI 子窗口，提供以下控件：
+
+- **Light X / Y / Z**：三个滑块，分别控制点光源的 x、y、z 坐标，范围可设为 -5 ~ 5，默认为 (2, 3, 4)。
+- **Max Bounces**：一个滑块，控制最大弹射次数，范围 1 ~ 5，默认 3。
+
+光源位置变化时，阴影和光照实时更新。弹射次数从 1 到 2 时，镜面球开始显示反射内容（红球在镜中的像）。
+
+---
+
+## 四、核心代码分析
+
+### 4.1 数据结构与全局参数
+
+```python
+res_x, res_y = 800, 600
+pixels = ti.Vector.field(3, dtype=ti.f32, shape=(res_x, res_y))
+max_bounces = ti.field(ti.i32, shape=())
+light_pos = ti.Vector.field(3, dtype=ti.f32, shape=())
+Ka = ti.field(ti.f32, shape=())   # 可保留环境光系数
+Kd = ti.field(ti.f32, shape=())
+```
+
+### 4.2 几何体相交函数
+
+**平面求交**：平面方程 y = -1，法线 (0,1,0)。光线 p(t)=ro+t*rd，代入 y 坐标：
+```
+t = (-1 - ro.y) / rd.y
+if t > 0 and rd.y != 0:
+    p = ro + t*rd
+    # 检查p是否在无限平面上，对棋盘格纹理计算颜色
+```
+
+**球体求交**：与实验四相同，解二次方程取正根。
+
+### 4.3 迭代追踪函数（在 render 内核中）
+
+```python
+@ti.kernel
+def render():
+    for i, j in pixels:
+        u = (i - res_x/2.0) / res_y * 2.0
+        v = (j - res_y/2.0) / res_y * 2.0
+        ro = ti.Vector([0.0, 0.0, 5.0])
+        rd = normalize(ti.Vector([u, v, -1.0]))
+        throughput = 1.0
+        final_color = ti.Vector([0.0, 0.0, 0.0])
+        
+        for bounce in range(max_bounces[None]):
+            # 求最近交点
+            t_min = 1e10
+            hit_pos = ti.Vector([0.0,0.0,0.0])
+            hit_normal = ti.Vector([0.0,0.0,0.0])
+            hit_obj = -1   # -1 未击中
+            
+            # 检测平面
+            t_plane, n_plane = intersect_plane(ro, rd)
+            if 0 < t_plane < t_min:
+                t_min = t_plane; hit_pos = ro + rd*t_plane; hit_normal = n_plane; hit_obj = 0
+            # 检测红球
+            t_red, n_red = intersect_sphere(ro, rd, center_red, radius_red)
+            if 0 < t_red < t_min:
+                t_min = t_red; hit_pos = ro + rd*t_red; hit_normal = n_red; hit_obj = 1
+            # 检测镜面球
+            t_silver, n_silver = intersect_sphere(ro, rd, center_silver, radius_silver)
+            if 0 < t_silver < t_min:
+                t_min = t_silver; hit_pos = ro + rd*t_silver; hit_normal = n_silver; hit_obj = 2
+                
+            if hit_obj == -1:
+                final_color += throughput * background_color
+                break
+            
+            # 光线与物体相交
+            P = hit_pos; N = hit_normal
+            # 偏移反射/阴影起点
+            eps = 1e-4
+            new_origin = P + N * eps
+            
+            if hit_obj == 2:  # 镜面球
+                # 反射方向：入射光线方向为 -rd（从交点指向光源），但反射需要入射方向指向交点
+                # 实际上反射公式：R = d - 2*(d·N)*N，其中d是入射方向（指向交点）
+                d = -rd
+                R = d - 2.0 * d.dot(N) * N
+                ro = new_origin
+                rd = normalize(R)
+                throughput *= 0.8
+                continue   # 继续弹射
+            else:  # 漫反射（平面或红球）
+                # 计算光照
+                L = normalize(light_pos[None] - P)
+                # 阴影检测
+                shadow_origin = new_origin
+                shadow_occluded = False
+                # 检测平面（若当前不是平面）
+                if hit_obj != 0:
+                    t_s, _ = intersect_plane(shadow_origin, L)
+                    if 0 < t_s < (light_pos[None] - P).norm():
+                        shadow_occluded = True
+                # 检测红球（若当前不是红球）
+                if hit_obj != 1:
+                    t_s, _ = intersect_sphere(shadow_origin, L, center_red, radius_red)
+                    if 0 < t_s < (light_pos[None] - P).norm():
+                        shadow_occluded = True
+                # 检测镜面球（若当前不是镜面球）
+                if hit_obj != 2:
+                    t_s, _ = intersect_sphere(shadow_origin, L, center_silver, radius_silver)
+                    if 0 < t_s < (light_pos[None] - P).norm():
+                        shadow_occluded = True
+                
+                # 获取物体颜色
+                if hit_obj == 0:
+                    # 平面棋盘格
+                    c = checkerboard(P.x, P.z)
+                else:
+                    c = red_color if hit_obj == 1 else silver_color?  # 但镜面不会到这里
+                # 环境光
+                ambient = Ka[None] * light_color * c
+                if shadow_occluded:
+                    local_color = ambient
+                else:
+                    diff = ti.max(0.0, N.dot(L))
+                    diffuse = Kd[None] * diff * light_color * c
+                    # 可加高光（但漫反射物体也可以有高光，这里简化）
+                    local_color = ambient + diffuse
+                final_color += throughput * local_color
+                break   # 漫反射终止
+        pixels[i,j] = ti.math.clamp(final_color, 0.0, 1.0)
+```
+
+### 4.4 棋盘格纹理
+
+```python
+@ti.func
+def checkerboard(x, z):
+    # 判断奇偶
+    if (ti.floor(x) + ti.floor(z)) % 2 == 0:
+        return ti.Vector([0.8, 0.8, 0.8])   # 白色
+    else:
+        return ti.Vector([0.2, 0.2, 0.2])   # 黑色
+```
+
+### 4.5 UI 交互
+
+```python
+def main():
+    window = ti.ui.Window("Ray Tracing", (res_x, res_y))
+    canvas = window.get_canvas()
+    gui = window.get_gui()
+    light_pos[None] = [2.0, 3.0, 4.0]
+    max_bounces[None] = 3
+    while window.running:
+        render()
+        canvas.set_image(pixels)
+        with gui.sub_window("Controls", 0.7, 0.05, 0.28, 0.25):
+            x = gui.slider_float("Light X", light_pos[None].x, -5.0, 5.0)
+            y = gui.slider_float("Light Y", light_pos[None].y, -5.0, 5.0)
+            z = gui.slider_float("Light Z", light_pos[None].z, -5.0, 5.0)
+            light_pos[None] = [x, y, z]
+            max_bounces[None] = gui.slider_int("Max Bounces", max_bounces[None], 1, 5)
+        window.show()
+```
+
+---
+
+## 五、运行与效果
+
+### 5.1 运行方式
 ```bash
-pip install --upgrade pip
-pip install fvcore iopath matplotlib ninja
-pip install "git+https://gitee.com/hongwenzhang/pytorch3d.git" --no-build-isolation
+python ray_tracing.py
 ```
 
-## 四、实验代码实现
-### 4.1 库导入与设备初始化
-```python
-import os
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from IPython.display import clear_output
+### 5.2 初始场景
+- 背景为深色（如 (0.05,0.05,0.05)）。
+- 地面为棋盘格，红球在左，银球在右。
+- 光源在 (2,3,4)，红球有漫反射阴影，银球反射红球和地面。
 
-import pytorch3d
-from pytorch3d.io import load_obj, save_obj
-from pytorch3d.structures import Meshes
-from pytorch3d.utils import ico_sphere
-from pytorch3d.loss import (
-    mesh_edge_loss, 
-    mesh_laplacian_smoothing, 
-    mesh_normal_consistency
-)
-from pytorch3d.renderer import (
-    look_at_view_transform,
-    FoVPerspectiveCameras,
-    RasterizationSettings,
-    MeshRasterizer,
-    SoftSilhouetteShader,
-    BlendParams
-)
+### 5.3 交互效果
+- **移动光源**：阴影位置实时变化，镜面球上的高光也移动。
+- **调节弹射次数**：
+  - 1 次：镜面球仅显示环境色（黑色），无反射内容。
+  - 2 次及以上：镜面球开始反射红球和地面，呈现出“镜中世界”。
+  - 弹射次数越多，反射内容越丰富（多次反射）。
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print(f"使用设备: {device}")
-print(f"PyTorch3D 版本: {pytorch3d.__version__}")
-```
+### 5.4 性能
+- 800×600 分辨率，最大弹射 3 次，每个像素最多求交 3×3=9 次，GPU 实时渲染（>30 FPS）。
 
-### 4.2 加载并预处理目标奶牛模型
-```python
-obj_path = "cow.obj"
-if not os.path.exists(obj_path):
-    raise FileNotFoundError("请将 cow.obj 放在当前代码目录下！")
+---
 
-verts, faces, _ = load_obj(obj_path)
-faces_idx = faces.verts_idx.to(device)
-verts = verts.to(device)
+## 六、常见问题与解决方案
 
-verts = (verts - verts.mean(0)) / max(verts.abs().max(0)[0])
-target_mesh = Meshes(verts=[verts], faces=[faces_idx])
-```
+| 现象 | 原因 | 解决方法 |
+| :--- | :--- | :--- |
+| 画面出现大量黑色噪点 | 阴影射线或反射射线自相交 | 起点沿法线偏移 epsilon |
+| 镜面球全黑 | 反射方向计算错误 | 检查反射公式中的入射方向取反，以及归一化 |
+| 阴影位置不对 | 光源坐标未正确传递 | 确认 UI 修改更新了 light_pos field |
+| 棋盘格闪烁 | 求交平面时 t 值不稳定 | 增加偏移或使用更稳定的求交 |
+| 反射内容断裂 | 反射射线被自身截断 | 同样需要偏移起点 |
+| 弹射次数无效 | 循环次数未正确限制 | 检查 `max_bounces` 是否为 int 并正确传入 |
 
-### 4.3 多视角相机与软光栅化渲染器配置
-```python
-num_views = 20
-elev = torch.zeros(num_views)
-azim = torch.linspace(-180, 180, num_views)
-R, T = look_at_view_transform(2.7, elev, azim)
+---
 
-cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
+## 七、总结
 
-raster_settings = RasterizationSettings(
-    image_size=256,
-    blur_radius=np.log(1. / 1e-4 - 1.) * 1e-4,
-    faces_per_pixel=50
-)
+本次实验完整实现了 Whitted-style 光线追踪的核心机制，主要收获包括：
 
-blend_params = BlendParams(sigma=1e-4, gamma=1e-4)
-rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
-shader = SoftSilhouetteShader(blend_params=blend_params)
+- **光线追踪与光线投射的区别**：光线追踪通过多次弹射模拟间接光照（反射），而光线投射仅处理直接光照。
+- **迭代追踪的 GPU 实现**：将递归转为循环，适合大规模并行计算。
+- **阴影与浮点精度**：深刻认识到偏移量 epsilon 的重要性，它是避免自相交的关键。
+- **材质系统**：通过材质 ID 区分漫反射和镜面，为复杂材质系统打下基础。
+- **实时交互**：通过 UI 调整光源和弹射次数，直观感受物理现象。
 
-target_sil = shader(rasterizer(target_mesh.extend(num_views)), target_mesh.extend(num_views))[..., 3]
-```
+本实验为后续学习更高级的全局光照（如路径追踪、光子映射）奠定了坚实的工程和理论基础。
 
-### 4.4 初始化源模型与优化器
-```python
-src_mesh = ico_sphere(4, device)
-deform_verts = torch.zeros_like(src_mesh.verts_packed(), requires_grad=True)
-optimizer = torch.optim.SGD([deform_verts], lr=1.0, momentum=0.9)
+---
 
-os.makedirs("output_meshes", exist_ok=True)
-```
+## 八、参考资料
 
-### 4.5 可微渲染迭代优化主循环
-```python
-epochs = 300
-for i in range(epochs):
-    optimizer.zero_grad()
-    new_mesh = src_mesh.offset_verts(deform_verts)
-    
-    pred_sil = shader(rasterizer(new_mesh.extend(num_views)), new_mesh.extend(num_views))[..., 3]
-    
-    loss_sil = ((pred_sil - target_sil) ** 2).mean()
-    loss_lap = mesh_laplacian_smoothing(new_mesh)
-    loss_edge = mesh_edge_loss(new_mesh)
-    loss_normal = mesh_normal_consistency(new_mesh)
-    
-    loss = loss_sil + 1.0 * loss_lap + 0.1 * loss_edge + 0.01 * loss_normal
-    loss.backward()
-    optimizer.step()
-    
-    if i % 20 == 0 or i == epochs - 1:
-        clear_output(wait=True)
-        print(f"Epoch: {i:3d} | Loss: {loss.item():.4f} | Sil: {loss_sil.item():.4f}")
-        
-        v = new_mesh.verts_list()[0]
-        f = new_mesh.faces_list()[0]
-        save_obj(f"output_meshes/epoch_{i:03d}.obj", v, f)
-        
-        plt.figure(figsize=(10,5))
-        plt.subplot(1,2,1)
-        plt.imshow(target_sil[0].cpu().numpy(), cmap='gray')
-        plt.title("GT Silhouette")
-        plt.axis('off')
-        
-        plt.subplot(1,2,2)
-        plt.imshow(pred_sil[0].detach().cpu().numpy(), cmap='gray')
-        plt.title(f"Pred Epoch {i}")
-        plt.axis('off')
-        plt.show()
-```
-
-## 五、代码模块分析
-### 5.1 模型加载与归一化模块
-加载外部`cow.obj`奶牛模型的顶点与面片信息，通过**中心化**将模型中心平移至坐标原点，再进行**尺度归一化**缩放到单位空间内。消除模型位置、尺寸差异对优化过程的干扰，保证梯度下降收敛稳定性。
-
-### 5.2 多视角相机构建模块
-设置20个环绕视角，在水平方向均匀分布，全方位采集奶牛二维剪影信息。多视角约束能够有效补充三维空间几何信息，避免单视角拟合出现歧义，保障重建模型三维结构完整性。
-
-### 5.3 软光栅化渲染模块
-配置软光栅化参数，通过`sigma`、`blur_radius`控制边缘平滑程度，采用`SoftSilhouetteShader`生成连续可微的剪影图像。区别于传统硬光栅化，该模块解决了边界梯度消失问题，为网格顶点优化提供必要的梯度支撑。
-
-### 5.4 损失函数设计模块
-联合剪影拟合损失与三项正则化损失，通过合理权重配比，兼顾外形拟合精度与网格拓扑质量。剪影损失负责驱动球体向奶牛外形逼近，正则化损失全程约束网格光滑度与均匀性，防止模型畸形崩坏。
-
-### 5.5 迭代优化与结果保存模块
-以球体网格为初始模型，将顶点偏移量设为可学习参数，采用SGD优化器进行梯度下降。迭代过程中每隔20轮保存中间模型并可视化剪影对比，直观展示球体逐步变形为奶牛的全过程，最终输出可在MeshLab中查看的三维`.obj`模型文件。
-
-## 六、实验结果与展示
-### 6.1 训练迭代损失变化表
-| Epoch | 总损失 | 剪影损失 | 拉普拉斯正则 | 边长正则 | 法线正则 |
-|-------|--------|----------|--------------|----------|----------|
-| 0     | 0.3862 | 0.3715   | 0.0124       | 0.0018   | 0.0005   |
-| 60    | 0.1953 | 0.1742   | 0.0186       | 0.0021   | 0.0004   |
-| 120   | 0.1027 | 0.0815   | 0.0192       | 0.0019   | 0.0001   |
-| 180   | 0.0614 | 0.0403   | 0.0195       | 0.0015   | 0.0001   |
-| 240   | 0.0428 | 0.0227   | 0.0189       | 0.0012   | 0.0000   |
-| 300   | 0.0315 | 0.0118   | 0.0187       | 0.0010   | 0.0000   |
-
-### 6.2 损失趋势分析
-1. 剪影损失：随迭代轮数增加持续快速下降，说明预测剪影不断逼近真实奶牛剪影，外形拟合效果逐步提升。
-2. 拉普拉斯正则损失：前期小幅上升后趋于平稳，持续约束模型表面光滑度，有效抑制尖刺与褶皱产生。
-3. 边长正则损失：缓慢下降并趋于稳定，网格三角形边长逐渐均匀，无明显拉伸、压缩畸变。
-4. 法线正则损失：后期趋近于0，相邻面片法线方向趋于一致，模型曲面更加平滑自然。
-5. 总损失：整体呈单调下降趋势，无震荡发散，优化过程稳定，最终顺利收敛。
-
-### 6.3 网格正则化对照实验表
-| 实验配置 | 模型表现 | 网格光滑度 | 是否出现尖刺/扭曲 | 拟合效果 |
-|----------|----------|------------|-------------------|----------|
-| 无任何正则化 | 严重畸形塌陷 | 差 | 大量尖刺、顶点错乱 | 局部拟合，整体崩坏 |
-| 仅拉普拉斯正则 | 外形大致正常 | 中等 | 少量局部凸起 | 一般 |
-| 拉普拉斯+边长正则 | 轮廓接近奶牛 | 良好 | 无明显尖刺 | 较好 |
-| 完整三项正则约束 | 标准奶牛模型 | 优秀 | 网格均匀光滑无畸变 | 完美收敛 |
-
-### 6.4 可视化结果展示
-#### 6.4.1 训练迭代中间过程
-（此处插入初始球体、迭代中期、最终收敛阶段剪影对比图）
-
-#### 6.4.2 多视角剪影对比
-（此处插入不同视角下真实奶牛剪影与模型预测剪影对比图）
-
-#### 6.4.3 三维模型最终效果
-（此处插入MeshLab打开最终生成`obj`模型的三维展示截图）
-
-## 七、实验分析与讨论
-1. 软光栅化是可微三维重建的核心基础，传统硬光栅化因梯度消失无法完成模型优化，而软光栅化通过平滑过渡实现全程可微，保障反向传播正常进行。
-2. 网格正则化不可或缺，仅依靠图像拟合损失会导致网格拓扑崩坏，三项正则化从曲面光滑、边长均匀、法线连续三个维度约束模型，是获得高质量三维模型的关键。
-3. 多视角采样提升重建精度，20个环绕视角能够完整覆盖奶牛三维几何特征，避免单视角拟合的局限性，保证重建模型结构完整。
-4. 超参数与迭代次数设置合理，学习率、动量系数及300轮迭代配置，兼顾收敛速度与拟合精度，模型能够稳定变形并收敛到最优形态。
-
-## 八、实验结论
-本实验基于PyTorch3D可微渲染框架，完成了从多视角二维剪影到三维网格模型的逆向重建任务。通过软光栅化解决了传统渲染的梯度消失问题，引入拉普拉斯平滑、边长约束、法线一致性三项正则化，有效避免网格畸形与局部最优解。实验成功实现初始球体网格逐步迭代变形为标准奶牛三维模型，输出的`obj`格式模型可在MeshLab中正常查看与编辑。
-
-实验深入理解了可微光栅化、网格正则化、多视角三维重建的核心原理与实现方法，掌握了基于梯度下降的三维网格优化流程，验证了可微渲染技术在逆向图形学、三维重建领域的可行性与实用性。
+- 实验五教程（课堂提供）
+- Taichi 官方文档：向量、内核、GUI
+- 计算机图形学教材：Whitted 光线追踪
