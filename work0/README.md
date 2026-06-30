@@ -378,5 +378,3 @@ CG-Lab/
 - [Python src 布局 vs 扁平布局](https://packaging.pythonlang.cn/en/latest/discussions/src-layout-vs-flat-layout/)
 - [Taichi 官方文档](https://docs.taichi-lang.org/)
 - [Markdown 基本语法](https://markdown.com.cn/basic-syntax/)
-
-> **最终成果**：本次实验所有代码已成功提交至 Gitee 公有仓库，并在 README 中附带了运行效果截图与 GPU 调用信息，符合实验全部要求。
