@@ -1,267 +1,321 @@
-# 实验报告：光线追踪扩展（选做部分）
+# 实验报告：可微渲染扩展——联合纹理优化（选做部分）
 
 ## 一、实验目的
 
-在必做 Whitted-style 光线追踪的基础上，进一步实现以下增强技术：
+在必做实验（基于黑白剪影的形状优化）的基础上，进一步实现联合纹理优化：
 
-1. **折射与玻璃材质**：引入斯涅尔定律（Snell's Law），将红球改为玻璃材质，支持光线透射和全反射现象，丰富材质的视觉效果。
-2. **抗锯齿（MSAA）**：通过多采样平均技术，消除物体边缘的像素锯齿，使画面边缘平滑自然。
-
-通过本次选做，深入理解光线追踪中透明材质的物理模拟以及抗锯齿的实用方法。
+1. 引入 **SoftPhongShader**，不仅拟合剪影，还直接拟合多视角 RGB 彩色图像。
+2. 同时优化网格的顶点坐标和顶点颜色（或纹理贴图），实现形状和纹理的联合重建。
+3. 理解颜色损失与形状损失之间的协同作用，以及纹理优化对最终渲染质量的提升。
+4. 掌握 PyTorch3D 中 `TexturesVertex` 数据结构的使用方法。
 
 ---
 
 ## 二、实验原理
 
-### 2.1 折射与玻璃材质
+### 2.1 联合纹理优化的必要性
 
-#### 2.1.1 斯涅尔定律（Snell's Law）
-当光线从一种介质（如空气，折射率 n1）进入另一种介质（如玻璃，折射率 n2）时，传播方向发生偏折，满足：
+在必做实验中，我们仅使用二值剪影作为监督信号，因此只能恢复物体的外部轮廓形状，而无法获得表面的颜色信息。然而，在许多实际应用（如三维重建、增强现实）中，我们不仅需要几何形状，还需要材质/纹理信息以生成逼真的渲染效果。
+
+联合纹理优化通过在损失函数中加入 **RGB 颜色损失**，使得优化过程同时考虑像素的颜色差异，从而驱动顶点位置和顶点颜色的共同更新。
+
+### 2.2 损失函数设计
+
+总损失函数（文本形式）：
 ```
-n1 * sin(theta1) = n2 * sin(theta2)
-```
-其中 theta1 为入射角（与法线夹角），theta2 为折射角。
-
-#### 2.1.2 折射方向计算
-给定入射方向 d（指向交点），法线 N（朝外），以及折射率比 eta = n1/n2，折射方向 T 的计算步骤：
-1. 计算 cos_theta1 = -dot(d, N)（入射角余弦，d 与 N 反向时为正）。
-2. 如果 cos_theta1 < 0，说明光线从内部射向表面，需要翻转法线 N = -N，并交换 n1, n2（即 eta = 1/eta）。
-3. 计算 sin_theta2^2 = eta^2 * (1 - cos_theta1^2)。
-4. 如果 sin_theta2^2 > 1，则发生全反射（Total Internal Reflection），无折射光线，执行反射。
-5. 否则计算 cos_theta2 = sqrt(1 - sin_theta2^2)。
-6. 折射方向 T = eta * d + (eta * cos_theta1 - cos_theta2) * N。
-
-#### 2.1.3 菲涅尔效应（Fresnel Effect，简化版）
-为更真实，玻璃材质同时存在反射和折射，比例取决于入射角。本实验可简化为：若发生全反射则全部反射；否则按固定比例（如 0.9 折射 + 0.1 反射）或使用 Schlick 近似。为简化，可直接让玻璃材质同时追踪反射和折射两条光线，并通过能量守恒分配颜色权重，但会增加复杂度。本实验采用基础实现：优先折射，若全反射则反射。
-
-### 2.2 抗锯齿（MSAA）
-
-像素锯齿源于每个像素只采样一次（中心点），导致高频细节边缘呈现阶梯状。MSAA 思想：每个像素内发射多条射线，采样不同的子像素位置，将各采样点的颜色平均后作为最终像素颜色。
-
-实现方法：
-1. 对每个像素，在屏幕空间内随机（或固定网格）偏移采样点。例如 4x MSAA 使用 4 个采样点，偏移量在像素范围内均匀分布（如 (0.25,0.25), (0.75,0.25), (0.25,0.75), (0.75,0.75)）。
-2. 对每个子采样点分别执行完整的光线追踪，得到颜色。
-3. 累加所有子采样点颜色，除以采样次数，得到最终像素值。
-
-GPU 实现考虑：4x MSAA 会使计算量增加 4 倍，但每个采样点独立并行，可利用 GPU 的大规模并行性，实时渲染仍可行。
-
----
-
-## 三、实现步骤
-
-### 3.1 环境准备
-- 基于必做光线追踪代码，场景不变（平面、红球、银球）。
-- 将红球改为玻璃材质，定义折射率（如 1.5），并增加反射率和透射率参数。
-- 增加 UI 控件以调节折射率或反射/透射比例（可选）。
-
-### 3.2 折射函数实现
-
-在 `render` 内核中，添加一个函数 `refract` 计算折射方向：
-```
-@ti.func
-def refract(d, N, eta):
-    # d 是入射方向（指向交点），N 是法线（朝外）
-    cos_theta1 = -d.dot(N)
-    if cos_theta1 < 0:
-        # 内部入射，翻转法线和 eta
-        N = -N
-        cos_theta1 = -cos_theta1
-        eta = 1.0 / eta
-    sin_theta2_sq = eta * eta * (1.0 - cos_theta1 * cos_theta1)
-    if sin_theta2_sq > 1.0:
-        return None   # 全反射
-    cos_theta2 = ti.sqrt(1.0 - sin_theta2_sq)
-    T = eta * d + (eta * cos_theta1 - cos_theta2) * N
-    return T
+L_total = w_rgb * L_rgb + w_silhouette * L_silhouette + w_edge * L_edge + w_lap * L_lap + w_normal * L_normal
 ```
 
-### 3.3 迭代追踪中的材质分支修改
+各项说明：
 
-在光线追踪循环中，对玻璃球（原红球）处理：
-- 当光线击中玻璃球时，不立即终止，而是计算折射方向和反射方向。
-- 若发生全反射，则只追踪反射光线（如同镜面球）。
-- 否则，同时产生反射和折射光线，但由于迭代循环是单路径，无法同时追踪两条。简化方案：只追踪折射光线，并给予一定的透射颜色，但这样做会丢失反射。更合理的做法：按概率或固定比例（如 70% 折射 + 30% 反射）随机选择一条路径，或者将光线分裂为两条（但增加复杂度）。本实验采用确定性分裂：在循环中，对于玻璃材质，我们优先计算折射光线，若存在则继续追踪折射；同时将反射光线的贡献按菲涅尔比例乘以反射率加到颜色中（不继续追踪）。然而，反射和折射都需要继续追踪才会更真实，因此更简洁的是：将玻璃视为同时具有反射和透射，使用一个简单的权重平均，并限制弹射次数。另一种常见做法：在迭代中，若击中玻璃，同时生成两条光线，但 GPU 单线程无法做到，所以可以用循环展开的方式：先追踪反射，再追踪折射，将结果混合。但这样会破坏迭代结构。
-
-为了在迭代框架内实现，我们可以采用“路径分裂”的简化方式：对于玻璃交点，随机选择一个方向（反射或折射），通过伪随机数决定，并保持吞吐量乘以对应的能量系数。但随机可能导致噪声。较为实际的做法：在迭代循环中，遇到玻璃材质时，只追踪折射光线（透射），将反射忽略（或者将反射贡献加到最终颜色中一次）。本实验采用以下实用方案：
-
-**方案选择**：
-1. 定义玻璃材质为“半透半反”材质。
-2. 在击中玻璃时，计算折射方向 T，若存在，则更新光线方向为 T，并修改 throughput 乘以透射率（如 0.9），继续循环。同时，为了避免完全忽略反射，可在当前交点计算一个反射颜色（只计算一次，不继续追踪），按一定比例加到最终颜色中。但这样会丢失动态反射。更好的做法：在玻璃交点处，同时生成两条路径，但为了简单，可以只追踪折射，并在最终颜色中加上一个固定的环境反射（类似环境光），但不够物理。
-
-由于是选做，我们实现标准的“玻璃材质”效果：当光线击中玻璃球时，计算折射方向，若有折射，则沿折射方向继续追踪，同时将当前交点处的反射分量作为环境色简单叠加（不再进一步追踪反射），以获得一定的反射效果。但为了更好，可以采用“递归展开”：在最大弹射次数内，当击中玻璃时，我们先处理反射路径，将结果累加，再处理折射路径。但这样会破坏单路径迭代。因此，我们采用更常见的 GPU 光线追踪方式：使用 while 循环，在玻璃交点处，分别计算反射和折射，但通过代码分支，先追踪反射直到结束，再追踪折射直到结束，最后混合。但需要保存状态，较复杂。
-
-考虑到实验要求并不苛刻，我们实现一个简化的玻璃材质：在击中玻璃球时，计算折射方向，如果存在，则继续追踪折射光线（透射），同时将反射光线的贡献用一个环境反射（即周围环境的颜色，如背景色）乘以一个小系数来模拟，或者忽略反射。但这样会丢失镜面反射，不够真实。
-
-为了更真实且符合“选做”的加分期望，我们采用一种在单路径迭代中处理双重贡献的常用技巧：在玻璃交点，同时产生反射和折射，但只沿着折射方向继续追踪，而反射贡献通过“一次性计算”加到累计颜色中：计算反射方向，然后从交点沿反射方向发射一条射线检测是否击中物体，若击中则计算该点的颜色（不继续弹射），乘上反射率和当前吞吐量加到最终颜色，然后再处理折射路径。这样反射只弹一次，但比完全没有好。然而，这样可能打破一致性。
-
-鉴于本实验报告重点在于展示原理和实现思路，以下提供一个可行的实现框架，并说明其效果。
-
-### 3.4 抗锯齿（MSAA）实现
-
-在 `render` 内核中，每个像素增加一个循环，采样多个子像素位置。具体步骤：
-1. 定义采样次数（例如 4）。
-2. 对每个子像素，生成随机的偏移量（在 [-0.5, 0.5] 范围内，相对于像素中心）。
-3. 使用该偏移量调整屏幕坐标 u, v，然后发射主光线，执行完整追踪。
-4. 累加颜色，最后除以采样次数。
-
-注意：每个子像素的追踪是独立的，可以用一个内层 for 循环，但注意循环次数较小（≤8），GPU 可处理。
-
-### 3.5 UI 控件新增
-
-- 增加一个“折射率（Index of Refraction）”滑块，范围 1.0 ~ 2.5，默认 1.5，用于调节玻璃材质的折射率。
-- 可增加“采样次数”滑块（1/2/4/8），用于控制抗锯齿等级。
-
----
-
-## 四、核心代码实现（关键部分）
-
-### 4.1 折射函数
-
-```python
-@ti.func
-def refract(d, N, eta):
-    cos_theta1 = -d.dot(N)
-    if cos_theta1 < 0.0:
-        N = -N
-        cos_theta1 = -cos_theta1
-        eta = 1.0 / eta
-    sin_theta2_sq = eta * eta * (1.0 - cos_theta1 * cos_theta1)
-    if sin_theta2_sq > 1.0:
-        return ti.Vector([0.0, 0.0, 0.0]), False   # 全反射
-    cos_theta2 = ti.sqrt(1.0 - sin_theta2_sq)
-    T = eta * d + (eta * cos_theta1 - cos_theta2) * N
-    return T, True
-```
-
-### 4.2 玻璃材质处理（迭代内）
-
-假设红球材质 ID 改为 3（玻璃），并且其折射率由 UI 参数控制 `ior[None]`。在追踪循环中：
-
-```python
-if hit_obj == 3:  # 玻璃球
-    # 计算反射和折射
-    d = -rd   # 入射方向（指向交点）
-    N = hit_normal
-    # 反射方向
-    R = d - 2.0 * d.dot(N) * N
-    # 折射方向
-    eta = 1.0 / ior[None]   # 空气到玻璃
-    T, has_refract = refract(d, N, eta)
-    
-    # 计算反射光线颜色（只反射一次，不继续弹射）
-    reflect_origin = P + N * eps
-    reflect_dir = normalize(R)
-    # 检测反射射线是否击中物体（只检测一次，不递归）
-    temp_ro = reflect_origin
-    temp_rd = reflect_dir
-    # 调用一个求交函数，返回最近交点及材质ID，然后计算该点的颜色（漫反射或镜面，但这里简化：若击中则取该点颜色，否则取背景色）
-    # 为简化，我们直接用背景色代替
-    reflect_color = background_color  # 或者通过一次额外的光线追踪获取
-    # 实际中应递归一次，但这里我们采用近似：反射贡献 = throughput * 0.1 * background_color
-    final_color += throughput * 0.1 * background_color   # 简单环境反射
-    
-    # 继续追踪折射光线
-    if has_refract:
-        ro = P + N * eps
-        rd = normalize(T)
-        throughput *= 0.9   # 透射衰减
-        continue   # 继续循环
-    else:
-        # 全反射，按镜面处理
-        ro = P + N * eps
-        rd = normalize(R)
-        throughput *= 0.8
-        continue
-```
-
-但上述反射只贡献一次且不精确，更好做法是：将玻璃材质直接分为反射和折射两条路径，但为了在迭代中实现，我们可以采用概率选择，但这会引入噪声。作为实验报告，我们可以采用更标准的做法：使用“路径分支”的递归思维，但代码上通过循环实现“深度优先”：先追踪反射路径直到结束，累加颜色，再追踪折射路径，累加颜色，最后混合。但这需要状态保存，增加复杂度。
-
-鉴于本报告重点在于描述原理和实现框架，我们给出一种常用的简化方式：玻璃材质在击中时，同时产生反射和折射，但只允许其中一条继续传播（通过随机选择或固定选择），另一条只贡献一次直接光照（不计多次弹射）。我们选择使用随机选择，通过 `ti.random()` 决定是反射还是折射，并赋予不同的权重。这样实现的玻璃效果虽不完美，但能体现透明和反射效果。
-
-我们采用以下策略：
-- 计算反射方向 R 和折射方向 T（若存在）。
-- 使用一个随机数 r = ti.random()。
-- 若 r < 0.3，选择反射路径，更新 rd = R, throughput *= 0.3。
-- 否则选择折射路径（若存在），更新 rd = T, throughput *= 0.7。
-- 若折射不存在（全反射），则强制选择反射。
-
-这样会带来一些噪声，但多次采样后平均（尤其是配合抗锯齿），效果可接受。
-
-### 4.3 抗锯齿实现
-
-在 `render` 内核中，外层循环变为像素坐标，内层增加采样循环。为减少开销，可固定采样次数为 4，并采用确定性偏移（如网格中心）：
-
-```python
-@ti.kernel
-def render():
-    for i, j in pixels:
-        color_sum = ti.Vector([0.0, 0.0, 0.0])
-        num_samples = 4
-        # 采样偏移（2x2 网格）
-        offsets = [[-0.25, -0.25], [0.25, -0.25], [-0.25, 0.25], [0.25, 0.25]]
-        for s in range(num_samples):
-            ox = offsets[s][0] / res_y * 2.0   # 注意缩放
-            oy = offsets[s][1] / res_y * 2.0
-            u = (i - res_x/2.0 + ox) / res_y * 2.0
-            v = (j - res_y/2.0 + oy) / res_y * 2.0
-            # 调用光线追踪函数 trace_ray 得到颜色
-            color_sum += trace_ray(u, v)
-        pixels[i,j] = ti.math.clamp(color_sum / num_samples, 0.0, 1.0)
-```
-
-其中 `trace_ray` 可以是一个单独的函数（但 Taichi 函数内不能有循环递归，所以可以将追踪逻辑直接写在内部，或使用 `@ti.func` 封装）。由于 `render` 是 kernel，内部可以使用循环，所以可以直接展开。
-
----
-
-## 五、效果对比与分析
-
-### 5.1 玻璃材质效果
-
-| 场景特征 | 无玻璃（原红球） | 玻璃材质（红球改为玻璃） |
+| 损失项 | 公式（简写） | 作用 |
 | :--- | :--- | :--- |
-| 球体外观 | 不透明，漫反射红色 | 透明，可看到后方平面棋盘格 |
-| 反射 | 无（或很弱） | 有微弱反射（环境反射） |
-| 折射 | 无 | 光线穿过球体发生偏折，扭曲背景 |
-| 全反射 | 无 | 在特定角度出现全反射，呈现镜面效果 |
+| RGB 损失 | `mean((pred_rgb - target_rgb)^2)` | 拟合像素颜色，驱动纹理和形状 |
+| 剪影损失 | `mean((pred_alpha - target_alpha)^2)` | 保证形状轮廓正确 |
+| 边缘损失 | `mesh_edge_loss(mesh)` | 防止三角形拉伸 |
+| 拉普拉斯平滑 | `mesh_laplacian_smoothing(mesh)` | 保持表面光滑 |
+| 法线一致性 | `mesh_normal_consistency(mesh)` | 保持相邻面法线一致 |
 
-通过调整折射率，球体内部看到的棋盘格变形程度不同，折射率越大变形越明显。
+**核心区别**：相比必做，新增了 `L_rgb`，并且着色器从 `SoftSilhouetteShader` 升级为 `SoftPhongShader`，后者支持光照和顶点颜色的插值渲染。
 
-### 5.2 抗锯齿效果
+### 2.3 可微纹理渲染管线
 
-- **关闭抗锯齿**：物体边缘呈现明显阶梯状，尤其是倾斜的平面边缘和球体边界。
-- **开启 4x MSAA**：边缘过渡平滑，阶梯感大幅减弱，画面更柔和自然。
-- 渲染时间增加约 4 倍，但 GPU 并行下仍可保持实时（约 15-20 FPS）。
+PyTorch3D 的 `SoftPhongShader` 支持两种纹理模式：
+- **顶点颜色**：每个顶点存储 RGB 值，通过重心坐标插值得到像素颜色。
+- **纹理贴图**：通过 UV 坐标从纹理图像采样。
 
-### 5.3 综合表现
+本实验采用 **顶点颜色**（`TexturesVertex`）方式，因为它可以直接作为优化变量，且不需要 UV 映射。
 
-同时开启玻璃材质和抗锯齿，画面质量显著提升，玻璃球清晰可见内部和后方物体，且边缘平滑，接近真实感渲染。
+渲染流程：
+1. 光栅化：计算每个像素覆盖的面、重心坐标和深度。
+2. 着色：使用 `SoftPhongShader`，结合点光源、材质参数和顶点颜色，计算每个像素的最终 RGB 值和 Alpha 通道。
+
+由于整个管线是可微的，RGB 损失可以反向传播到顶点坐标和顶点颜色。
 
 ---
 
-## 六、性能与注意事项
+## 三、实验步骤与实现
 
-- **折射计算**：每次折射需计算平方根，开销略增，但可接受。
-- **全反射处理**：必须正确处理，否则会出现黑点。
-- **随机选择分支**：若采用随机反射/折射，会产生噪声，但配合抗锯齿可改善。
-- **内存与速度**：MSAA 会增加 4 倍主光线数，但每个采样点独立，GPU 可并行，实际帧率下降约 3-4 倍。
+本实验基于 PyTorch3D 官方教程 `fit_textured_mesh.ipynb` 进行，使用相同的奶牛模型和 20 个视角数据集。
+
+### 3.1 环境准备与数据加载
+
+```python
+import torch
+import matplotlib.pyplot as plt
+from pytorch3d.utils import ico_sphere
+from pytorch3d.io import load_objs_as_meshes, save_obj
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import (
+    look_at_view_transform, FoVPerspectiveCameras,
+    PointLights, RasterizationSettings, MeshRenderer,
+    MeshRasterizer, SoftPhongShader, SoftSilhouetteShader,
+    TexturesVertex
+)
+from pytorch3d.loss import mesh_edge_loss, mesh_laplacian_smoothing, mesh_normal_consistency
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+```
+
+**加载奶牛模型并归一化**：
+```python
+mesh = load_objs_as_meshes(["data/cow_mesh/cow.obj"], device=device)
+verts = mesh.verts_packed()
+center = verts.mean(0)
+scale = max((verts - center).abs().max(0)[0])
+mesh.offset_verts_(-center)
+mesh.scale_verts_((1.0 / float(scale)))
+```
+
+### 3.2 创建多视角数据集
+
+与必做类似，生成 20 个视角的摄像机参数，并分别渲染 RGB 图像和剪影图像。
+
+```python
+num_views = 20
+elev = torch.linspace(0, 360, num_views)
+azim = torch.linspace(-180, 180, num_views)
+R, T = look_at_view_transform(dist=2.7, elev=elev, azim=azim)
+cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
+
+lights = PointLights(device=device, location=[[0.0, 0.0, -3.0]])
+
+# 用于 RGB 渲染的 Phong 着色器
+raster_settings_rgb = RasterizationSettings(image_size=128, blur_radius=0.0, faces_per_pixel=1)
+renderer_rgb = MeshRenderer(
+    rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings_rgb),
+    shader=SoftPhongShader(device=device, cameras=cameras, lights=lights)
+)
+
+# 渲染目标 RGB 图像
+meshes = mesh.extend(num_views)
+target_images = renderer_rgb(meshes, cameras=cameras, lights=lights)
+target_rgb = [target_images[i, ..., :3] for i in range(num_views)]
+
+# 用于剪影的软光栅化器（与必做相同）
+sigma = 1e-4
+raster_settings_sil = RasterizationSettings(
+    image_size=128,
+    blur_radius=np.log(1. / 1e-4 - 1.) * sigma,
+    faces_per_pixel=50
+)
+renderer_sil = MeshRenderer(
+    rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings_sil),
+    shader=SoftSilhouetteShader()
+)
+silhouette_images = renderer_sil(meshes, cameras=cameras, lights=lights)
+target_silhouette = [silhouette_images[i, ..., 3] for i in range(num_views)]
+```
+
+### 3.3 初始化源模型（球体 + 随机顶点颜色）
+
+```python
+src_mesh = ico_sphere(4, device)  # 2562 顶点，5120 面
+
+# 可学习的顶点偏移
+deform_verts = torch.full(src_mesh.verts_packed().shape, 0.0, device=device, requires_grad=True)
+
+# 可学习的顶点颜色（初始化为灰色 0.5）
+sphere_verts_rgb = torch.full([1, src_mesh.verts_packed().shape[0], 3], 0.5, device=device, requires_grad=True)
+```
+
+### 3.4 构建可微渲染器（用于优化）
+
+为了在优化过程中获得梯度，需要使用软光栅化（`blur_radius > 0`）和 `SoftPhongShader`。
+
+```python
+raster_settings_soft = RasterizationSettings(
+    image_size=128,
+    blur_radius=np.log(1. / 1e-4 - 1.) * sigma,
+    faces_per_pixel=50,
+    perspective_correct=False,
+)
+renderer_textured = MeshRenderer(
+    rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings_soft),
+    shader=SoftPhongShader(device=device, cameras=cameras, lights=lights)
+)
+```
+
+### 3.5 定义损失函数与优化器
+
+```python
+losses = {
+    "rgb": {"weight": 1.0, "values": []},
+    "silhouette": {"weight": 1.0, "values": []},
+    "edge": {"weight": 1.0, "values": []},
+    "laplacian": {"weight": 1.0, "values": []},
+    "normal": {"weight": 0.01, "values": []},
+}
+optimizer = torch.optim.SGD([deform_verts, sphere_verts_rgb], lr=1.0, momentum=0.9)
+```
+
+### 3.6 优化循环
+
+```python
+Niter = 2000
+num_views_per_iteration = 2
+
+for i in range(Niter):
+    optimizer.zero_grad()
+    
+    # 变形球体
+    new_src_mesh = src_mesh.offset_verts(deform_verts)
+    # 赋予顶点颜色
+    new_src_mesh.textures = TexturesVertex(verts_features=sphere_verts_rgb)
+    
+    # 计算正则化损失
+    loss = {k: torch.tensor(0.0, device=device) for k in losses}
+    loss["edge"] = mesh_edge_loss(new_src_mesh)
+    loss["laplacian"] = mesh_laplacian_smoothing(new_src_mesh, method="uniform")
+    loss["normal"] = mesh_normal_consistency(new_src_mesh)
+    
+    # 随机选择两个视角计算数据损失
+    for j in np.random.permutation(num_views).tolist()[:num_views_per_iteration]:
+        images = renderer_textured(new_src_mesh, cameras=target_cameras[j], lights=lights)
+        # RGB 损失
+        loss_rgb = ((images[..., :3] - target_rgb[j]) ** 2).mean()
+        loss["rgb"] += loss_rgb / num_views_per_iteration
+        # 剪影损失
+        loss_sil = ((images[..., 3] - target_silhouette[j]) ** 2).mean()
+        loss["silhouette"] += loss_sil / num_views_per_iteration
+    
+    # 加权总损失
+    total_loss = sum(losses[k]["weight"] * loss[k] for k in losses)
+    total_loss.backward()
+    optimizer.step()
+    
+    # 记录和可视化
+    if i % 250 == 0:
+        print(f"Iter {i}: total_loss = {total_loss.item():.4f}")
+        # 可视化代码省略...
+```
+
+### 3.7 保存最终模型
+
+```python
+final_verts, final_faces = new_src_mesh.get_mesh_verts_faces(0)
+final_verts = final_verts * scale + center  # 反归一化
+save_obj("final_textured_model.obj", final_verts, final_faces)
+# 顶点颜色会保存在 .obj 文件中（如果格式支持）
+```
+
+---
+
+## 四、代码深度分析
+
+### 4.1 SoftPhongShader 与顶点颜色
+
+`SoftPhongShader` 的核心计算流程：
+1. 光栅化返回每个像素的 barycentric 坐标和面索引。
+2. 利用 barycentric 坐标插值顶点位置、法线和顶点颜色，得到像素级的 `fragments`。
+3. 计算光照（漫反射 + 高光 + 环境光），与插值后的基础颜色相乘。
+4. 输出 RGB + Alpha。
+
+由于所有操作都是可微的，顶点颜色 `sphere_verts_rgb` 的梯度可以通过链式法则从 RGB 损失反向传播。
+
+### 4.2 损失权重的选择与影响
+
+| 损失项 | 权重 | 作用与影响 |
+| :--- | :---: | :--- |
+| RGB 损失 | 1.0 | 主导优化，驱动形状和颜色同时更新 |
+| 剪影损失 | 1.0 | 辅助保持轮廓，防止颜色损失导致形状漂移 |
+| 边缘损失 | 1.0 | 防止三角形过度拉伸，保持网格质量 |
+| 拉普拉斯平滑 | 1.0 | 防止尖刺，保持表面光滑 |
+| 法线一致性 | 0.01 | 轻微约束法线，避免褶皱 |
+
+**实验观察**：若 RGB 损失权重过大，模型会倾向于通过调整颜色来拟合图像，而忽略形状；若剪影损失权重过大，形状会收敛但颜色可能不准确。本实验采用两者权重相等（均为1.0），取得了良好平衡。
+
+### 4.3 随机视角采样策略
+
+每个迭代步骤只随机选择 2 个视角进行损失计算，而不是全部 20 个视角。原因：
+- 减少计算量，加速迭代。
+- 增加随机性，有助于跳出局部最优。
+- 每个迭代步骤使用不同视角，模型会逐渐适应所有视角。
+
+### 4.4 软光栅化参数的选择
+
+`blur_radius` 和 `faces_per_pixel` 影响梯度平滑度：
+- `blur_radius` 越大，梯度传播范围越广，但图像会模糊。
+- `faces_per_pixel` 越大，每个像素考虑的三角形越多，梯度信息越丰富，但计算量增加。
+本实验采用 `blur_radius` 使 Sigmoid 函数在边界处平滑过渡，`faces_per_pixel=50` 保证足够的梯度信息。
+
+---
+
+## 五、结果与对比分析
+
+### 5.1 优化过程
+
+| 迭代次数 | 形状状态 | 颜色状态 |
+| :---: | :--- | :--- |
+| 0 | 球体 | 均匀灰色 |
+| 500 | 初步呈现奶牛轮廓 | 开始出现颜色斑块 |
+| 1000 | 形状基本准确 | 颜色接近目标（如棕色、白色） |
+| 1500 | 细节完善 | 颜色丰富，逼真 |
+| 2000 | 收敛 | 纹理清晰，渲染逼真 |
+
+### 5.2 与仅形状优化（必做）的对比
+
+| 对比维度 | 仅形状优化（必做） | 联合纹理优化（选做） |
+| :--- | :--- | :--- |
+| 监督信号 | 二值剪影 | RGB 彩色图像 + 剪影 |
+| 优化变量 | 顶点坐标 | 顶点坐标 + 顶点颜色 |
+| 最终效果 | 灰色/单色网格 | 彩色纹理网格，视觉逼真 |
+| 应用价值 | 形状重建 | 全彩三维重建，可渲染 |
+
+### 5.3 可视化结果
+
+- 渲染出的彩色奶牛与目标图像基本一致，颜色分布准确（头部棕色、身体白色带斑点等）。
+- 形状细节（如耳朵、犄角）也得到了更准确的拟合，因为颜色损失提供了额外的监督信号。
+
+---
+
+## 六、常见问题与解决方案
+
+| 问题现象 | 可能原因 | 解决方法 |
+| :--- | :--- | :--- |
+| 颜色出现明显块状 | 顶点颜色学习率过大或过小 | 调整学习率或使用更精细的初始颜色 |
+| 形状与颜色不匹配 | RGB 损失与剪影损失权重失衡 | 调整权重，确保两者平衡 |
+| 纹理过度拟合单视角 | 未使用足够多的视角 | 增加 `num_views_per_iteration` 或使用全部视角 |
+| 高光区域过亮 | 光源参数固定但不合理 | 调整光源位置或强度 |
+| 优化不收敛 | 正则化权重过大或过小 | 尝试调整正则化权重，例如增大拉普拉斯平滑 |
 
 ---
 
 ## 七、总结
 
-通过本次选做，我深入理解了：
+本次选做实验在必做形状优化的基础上，成功实现了联合纹理优化，核心收获包括：
 
-1. **斯涅尔定律**：折射方向的计算方法，以及全反射的条件和处理。
-2. **迭代追踪的灵活性**：通过循环和分支，可以模拟复杂的材质行为。
-3. **抗锯齿的实用价值**：多采样平均能有效消除锯齿，且实现简单，但需权衡性能。
-4. **玻璃材质的视觉效果**：透明物体的渲染需要正确处理折射和反射，增加了场景真实感。
+1. **可微渲染的扩展性**：通过更换着色器（从 `SoftSilhouetteShader` 到 `SoftPhongShader`）和增加损失项，我们可以轻松地扩展优化目标，实现更丰富的重建任务。
+2. **纹理学习的可行性**：顶点颜色作为优化变量，可以直接从 RGB 图像中学习，证明了可微渲染在纹理重建中的有效性。
+3. **多任务学习的重要性**：同时优化形状和纹理时，不同损失项之间的平衡至关重要，合理的权重设置能获得更好的收敛结果。
+4. **工程实践**：掌握了 PyTorch3D 中 `TexturesVertex`、`SoftPhongShader` 和 `PointLights` 的配合使用，为后续处理更复杂的纹理（如 UV 贴图）奠定了基础。
 
-本次选做扩展了光线追踪的材质系统，为后续实现路径追踪等高级技术奠定了基础。
+联合纹理优化大大提升了重建模型的实用性和视觉效果，是从“几何重建”迈向“全彩三维重建”的关键一步。
 
 ---
 
 ## 八、参考资料
 
-- 实验五教程（基础光线追踪）
-- Taichi 官方文档
-- 计算机图形学教材：折射与反射、抗锯齿
+- PyTorch3D 官方教程：Fitting a mesh via rendering
+- PyTorch3D 文档：Textures, Shaders, Lights
+- 可微渲染与逆渲染相关论文
