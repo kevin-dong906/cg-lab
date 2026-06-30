@@ -1,158 +1,275 @@
-# 光线投射与迭代式光线追踪实验报告
-## 一、实验基本信息
-| 项目 | 内容 |
-| ---- | ---- |
-| 实验名称 | 基于Taichi的迭代式Whitted风格光线追踪实现 |
-| 开发环境 | Python + Taichi GPU计算框架 |
-| 硬件后端 | 自动适配CUDA/Vulkan/Metal |
-| 分辨率 | 800×600 |
-| 核心算法 | Whitted-Style光线追踪、迭代式光线弹射、硬阴影计算、镜面反射、棋盘格纹理映射 |
+# 实验报告：Phong光照模型（必做部分）
 
-## 二、实验目标
-1. **理论理解**：明晰光线投射（Ray Casting）仅单次光线弹射、光线追踪（Ray Tracing）支持多级次级射线弹射的本质差异。
-2. **全局光照掌握**：通过暗影射线实现硬阴影效果，利用反射向量公式实现理想镜面反射，理解次级射线的生成逻辑。
-3. **GPU编程思维**：将传统递归光线追踪改造为**循环迭代式**实现，适配GPU并行计算架构，规避递归调用开销。
-4. **工程实践**：实现三维场景搭建、材质系统、阴影精度修复、UI交互式参数调控。
+## 一、实验目的
 
-## 三、实验原理
-### 3.1 核心概念区别
-| 技术 | 弹射次数 | 效果能力 | 实现方式 |
-| ---- | -------- | -------- | -------- |
-| 光线投射 | 仅主光线一次弹射 | 仅基础着色，无反射、无阴影 | 单次场景求交 |
-| 光线追踪 | 支持多级迭代弹射 | 硬阴影、镜面反射、全局光照 | 主光线+暗影射线+反射次级射线 |
+1. **理论理解**：理解并掌握局部光照的基本原理，区分环境光（Ambient）、漫反射（Diffuse）和镜面高光（Specular）三个分量的物理意义和计算方式。
+2. **数学基础**：熟练掌握三维空间中的向量运算，包括法向量计算、光线方向、视线方向以及反射向量的求解与归一化。
+3. **工程实践**：掌握利用 Taichi 实现交互式渲染的方法，通过 UI 控件实时调节材质参数，直观感受各参数对渲染结果的影响。
 
-### 3.2 Whitted-Style光线追踪流程
-1. 摄像机发射**主光线**穿过像素，与场景几何体求交；
-2. 交点处发射**暗影射线**至光源，判断是否被遮挡，生成硬阴影；
-3. 按材质分支处理：
-   - 漫反射材质：基于Phong模型计算环境光+漫反射光，光线终止；
-   - 镜面材质：按反射公式生成**反射次级射线**，继续迭代追踪，直至达到最大弹射次数或击中漫反射物体。
+---
 
-### 3.3 关键数学公式
-反射向量计算公式：
-$$\mathbf{R} = \mathbf{L}_{in} - 2(\mathbf{L}_{in} \cdot \mathbf{N})\mathbf{N}$$
-$\mathbf{L}_{in}$：入射光线方向；$\mathbf{N}$：物体表面单位法向量。
+## 二、实验原理（Phong 光照模型）
 
-### 3.4 阴影自相交Bug原理
-射线求交时，交点会被判定为自身表面相交，产生**Shadow Acne黑色噪点**。
-解决方案：交点沿法线偏移极小阈值：
-$$\mathbf{P}_{new} = \mathbf{P} + \mathbf{N} \times \epsilon,\quad \epsilon=10^{-4}$$
+Phong 光照模型是一种经验模型，将物体表面反射的光分解为三个分量，最终颜色为三者之和：
 
-## 四、实验场景与设计
-### 4.1 场景几何体配置
-| 几何体 | 位置参数 | 半径/位置 | 材质类型 | 纹理/颜色 |
-| ---- | ---- | ---- | ---- | ---- |
-| 地面无限平面 | $y=-1.0$ | 水平平面 | 漫反射 | 黑白棋盘格纹理 |
-| 红色球体 | $(-1.5,0,0)$ | 半径1.0 | 漫反射 | 纯红色固有色 |
-| 银色球体 | $(1.5,0,0)$ | 半径1.0 | 理想镜面 | 高反射银色 |
+**总颜色 = 环境光 + 漫反射 + 镜面高光**
 
-### 4.2 材质系统设计
-定义两类材质ID：
-- `DIFFUSE = 0`：漫反射材质，光线击中后终止弹射，计算直接光照与阴影；
-- `MIRROR = 1`：镜面材质，生成反射射线，能量按反射率衰减并继续迭代。
+### 2.1 环境光（Ambient）
+模拟场景中经过多次反射后均匀分布的光，与光源方向、视线方向无关，仅取决于物体颜色和环境光系数。
 
-### 4.3 交互参数设计
-1. 光源三维坐标：`Light X/Y/Z` 滑动调节，实时改变阴影位置；
-2. 最大弹射次数：1~5级可调，控制镜面反射的弹射层数。
+公式（文本形式）：
+```
+I_ambient = K_a * C_light * C_object
+```
+- K_a：环境光反射系数（0~1）
+- C_light：光源颜色（本实验中为纯白 (1,1,1)）
+- C_object：物体基础颜色
 
-## 五、实验代码结构分析
-### 5.1 整体代码模块划分
-1. 初始化模块：Taichi GPU初始化、画布与全局参数定义；
-2. 数学工具函数：向量归一化、反射向量计算；
-3. 几何求交模块：球体求交、平面求交函数；
-4. 场景遍历模块：遍历所有几何体，返回最近交点、法线、材质、颜色；
-5. 渲染内核：迭代式光线追踪、光照计算、阴影检测；
-6. UI交互模块：窗口创建、滑动条控件、实时渲染循环。
+### 2.2 漫反射（Diffuse）
+模拟粗糙表面向各个方向均匀散射光，遵循 Lambert 余弦定律，强度与光线入射角（光源方向与法线夹角）的余弦成正比。
 
-### 5.2 核心关键代码块分析
-#### 1. 几何求交核心
+公式：
+```
+I_diffuse = K_d * max(0, N·L) * C_light * C_object
+```
+- K_d：漫反射系数
+- N：表面单位法向量
+- L：指向光源的单位向量
+- max(0, N·L)确保背面不受光
+
+### 2.3 镜面高光（Specular）
+模拟光滑表面反射的强光，集中在反射方向附近，强度与视线方向和理想反射方向的夹角有关。
+
+公式：
+```
+I_specular = K_s * max(0, R·V)^n * C_light
+```
+- K_s：镜面反射系数
+- R：理想反射方向（入射光关于法线的反射）
+- V：指向观察者的单位向量
+- n：高光指数（Shininess），越大高光越集中
+
+反射向量 R 的计算：
+```
+R = 2 * (L·N) * N - L
+```
+注意 L 是指向光源的方向，反射公式中入射光方向为 -L。
+
+---
+
+## 三、实验任务与实现
+
+本实验共包含四个必做任务，具体实现如下。
+
+### 3.1 任务1：构建代码驱动的三维场景
+
+不使用外部模型，通过光线投射（Ray Casting）在 GPU 内核中隐式定义两个几何体：
+
+- **红色球体**：中心 (-1.2, -0.2, 0)，半径 1.2，基础颜色 (0.8, 0.1, 0.1)
+- **紫色圆锥**：顶点 (1.2, 1.2, 0)，底面 y = -1.4，底面半径 1.2，基础颜色 (0.6, 0.2, 0.8)
+
+**摄像机**：固定在 (0, 0, 5)，向 -Z 方向观察。  
+**光源**：点光源位于 (2, 3, 4)，颜色为纯白 (1,1,1)。  
+**背景色**：深青色 (0.05, 0.15, 0.15)。
+
+### 3.2 任务2：光线求交与深度测试
+
+为每个像素发射光线，分别测试与球体和圆锥的交点，记录最近的交点（最小正 t）及其法向量和颜色。通过类似 Z-buffer 的竞争逻辑实现遮挡。
+
+**球体求交**：代入光线方程 p(t)=ro+t*rd 到球面方程 |p-C|^2=r^2，解一元二次方程取正根。
+
+**圆锥求交**：将圆锥用局部坐标表示，代入光线方程，解二次方程并验证交点是否在高度范围内。
+
+关键变量：
+- `min_t`：记录最近交点距离，初始为极大值。
+- `hit_normal` 和 `hit_color` 分别存储对应法向量和颜色。
+
+### 3.3 任务3：编写 Phong 着色器
+
+在最近交点 P 处计算：
+- 法向量 N（已归一化）
+- 光源方向 L = normalize(light_pos - P)
+- 视线方向 V = normalize(ro - P)
+- 反射方向 R = normalize(reflect(-L, N))
+
+然后按公式分别计算 ambient、diffuse、specular，求和后 clamp 到 [0,1]。
+
+### 3.4 任务4：UI 交互面板
+
+使用 `ti.ui.Window` 的子窗口提供四个滑动条，实时调整材质参数：
+
+| 参数 | 含义 | 范围 | 默认值 |
+| :---: | :--- | :---: | :---: |
+| Ka | 环境光系数 | 0.0 ~ 1.0 | 0.2 |
+| Kd | 漫反射系数 | 0.0 ~ 1.0 | 0.7 |
+| Ks | 镜面高光系数 | 0.0 ~ 1.0 | 0.5 |
+| Shininess | 高光指数 | 1.0 ~ 128.0 | 32.0 |
+
+---
+
+## 四、核心代码分析
+
+### 4.1 数据结构和参数定义
+
+```python
+res_x, res_y = 800, 600
+pixels = ti.Vector.field(3, dtype=ti.f32, shape=(res_x, res_y))
+Ka = ti.field(ti.f32, shape=())
+Kd = ti.field(ti.f32, shape=())
+Ks = ti.field(ti.f32, shape=())
+shininess = ti.field(ti.f32, shape=())
+```
+- `pixels` 是帧缓冲区，每个像素为 RGB 三元向量。
+- 四个材质参数定义为标量 field，便于在 GPU 内核中读取并在主线程更新。
+
+### 4.2 向量工具函数
+
 ```python
 @ti.func
-def sphere_intersect(ray_origin, ray_dir, sphere_center, sphere_radius):
-    t_result = -1.0
-    norm_result = ti.Vector([0.0, 0.0, 0.0])
-    oc = ray_origin - sphere_center
-    b_coeff = 2.0 * oc.dot(ray_dir)
-    c_coeff = oc.dot(oc) - sphere_radius ** 2
-    discriminant = b_coeff ** 2 - 4.0 * c_coeff
-    
-    if discriminant > 0:
-        t_val = (-b_coeff - ti.sqrt(discriminant)) / 2.0
-        if t_val > 0:
-            t_result = t_val
-            hit_point = ray_origin + ray_dir * t_val
-            norm_result = unit_vector(hit_point - sphere_center)
-    return t_result, norm_result
-```
-采用二次方程求解球体与射线交点，返回最近正距离交点与表面法向量，是光线追踪基础几何运算。
+def normalize(v):
+    return v / v.norm(1e-5)
 
-#### 2. 棋盘格纹理实现
+@ti.func
+def reflect(I, N):
+    return I - 2.0 * I.dot(N) * N
+```
+- `normalize` 加入微小量防除零。
+- `reflect` 输入入射方向 I，输出反射方向。
+
+### 4.3 球体相交函数
+
 ```python
-x_cell = ti.floor(p.x * scale)
-z_cell = ti.floor(p.z * scale)
-if (x_cell + z_cell) % 2 == 0:
-    hit_color = ti.Vector([0.25, 0.25, 0.25])
-else:
-    hit_color = ti.Vector([0.85, 0.85, 0.85])
+@ti.func
+def intersect_sphere(ro, rd, center, radius):
+    oc = ro - center
+    b = 2.0 * oc.dot(rd)
+    c = oc.dot(oc) - radius * radius
+    delta = b*b - 4.0*c
+    if delta > 0:
+        t1 = (-b - ti.sqrt(delta)) / 2.0
+        if t1 > 0:
+            t = t1
+            p = ro + rd * t
+            normal = normalize(p - center)
+    return t, normal
 ```
-通过交点x、z坐标网格化取整，利用坐标和的奇偶性切换灰度，生成规则棋盘格地面。
+求解二次方程，取较小正根，法向量从球心指向交点。
 
-#### 3. 迭代式光线弹射（GPU核心）
+### 4.4 圆锥相交函数
+
 ```python
-for _ in range(trace_bounces[None]):
-    t, normal, obj_color, mat = trace_scene(cam_origin, cam_dir)
-    if t > 1e9:
-        color_accum += energy * background
-        break
-    point = cam_origin + cam_dir * t
+@ti.func
+def intersect_cone(ro, rd, apex, base_y, radius):
+    H = apex.y - base_y
+    k = (radius / H)**2
+    ro_local = ro - apex
+    A = rd.x**2 + rd.z**2 - k * rd.y**2
+    B = 2.0 * (ro_local.x*rd.x + ro_local.z*rd.z - k*ro_local.y*rd.y)
+    C = ro_local.x**2 + ro_local.z**2 - k * ro_local.y**2
+    # 解二次方程，并验证交点高度范围
+    # 法线计算：normal = (p_local.x, -k*p_local.y, p_local.z)
 ```
-摒弃递归，改用`for`循环实现多级光线弹射，完美适配GPU并行计算，循环次数由交互滑块控制。
+圆锥在局部坐标系中满足 x^2+z^2 = k*y^2（顶点为原点，向下延伸）。求根后检查局部 y 是否在 [-H, 0] 内。
 
-#### 4. 阴影偏移修复
+### 4.5 渲染内核（Phong 着色）
+
 ```python
-cam_origin = point + normal * 1e-4
-shadow_origin = point + normal * 1e-4
+@ti.kernel
+def render():
+    for i, j in pixels:
+        u = (i - res_x/2.0) / res_y * 2.0
+        v = (j - res_y/2.0) / res_y * 2.0
+        ro = ti.Vector([0.0, 0.0, 5.0])
+        rd = normalize(ti.Vector([u, v, -1.0]))
+        # 求交深度测试...
+        # 着色
+        L = normalize(light_pos - p)
+        V = normalize(ro - p)
+        ambient = Ka[None] * light_color * hit_color
+        diff = ti.max(0.0, N.dot(L))
+        diffuse = Kd[None] * diff * light_color * hit_color
+        R = normalize(reflect(-L, N))
+        spec = ti.max(0.0, R.dot(V)) ** shininess[None]
+        specular = Ks[None] * spec * light_color
+        color = ambient + diffuse + specular
+        pixels[i, j] = ti.math.clamp(color, 0.0, 1.0)
 ```
-反射射线、暗影射线起点均沿法线偏移$10^{-4}$，彻底解决自相交导致的满屏黑点噪点问题。
 
-#### 5. 硬阴影检测逻辑
+- 外层循环自动并行到 GPU 线程。
+- 注意所有向量均调用 `normalize` 归一化。
+- 使用 `ti.max` 截断负值，防止背面光。
+- 最终 clamp 防止过曝。
+
+### 4.6 主循环与 UI
+
 ```python
-shadow_t, _, _, _ = trace_scene(shadow_origin, light_dir)
-light_dist = (light_position - point).norm()
-shadowed = 0.0
-if shadow_t < light_dist:
-    shadowed = 1.0
+def main():
+    window = ti.ui.Window("Phong Shading Demo", (res_x, res_y))
+    canvas = window.get_canvas()
+    gui = window.get_gui()
+    # 初始化参数
+    while window.running:
+        render()
+        canvas.set_image(pixels)
+        with gui.sub_window("Material Parameters", 0.7, 0.05, 0.28, 0.22):
+            Ka[None] = gui.slider_float('Ka (Ambient)', Ka[None], 0.0, 1.0)
+            Kd[None] = gui.slider_float('Kd (Diffuse)', Kd[None], 0.0, 1.0)
+            Ks[None] = gui.slider_float('Ks (Specular)', Ks[None], 0.0, 1.0)
+            shininess[None] = gui.slider_float('N (Shininess)', shininess[None], 1.0, 128.0)
+        window.show()
 ```
-向光源发射暗影射线，若中途存在更近交点，则判定为处于阴影，仅保留环境光。
+- 每帧先渲染再显示，UI 控件绑定到 field，修改后实时生效。
 
-## 六、实验步骤与现象观察
-### 6.1 实验操作步骤
-1. 运行代码，启动Taichi渲染窗口，默认初始化光源位置、最大弹射次数为3；
-2. 拖动`Light X/Y/Z`滑块，观察阴影随光源位置实时平移、缩放；
-3. 调节`Max Bounces`：
-   - 弹射次数=1：仅基础光线投射，无镜面反射效果；
-   - 弹射次数≥2：银色镜面球出现反射倒影，次数越高反射层次越丰富；
-4. 观察地面棋盘格纹理、红球漫反射阴影、银球镜面反射效果。
+---
 
-### 6.2 实验现象总结
-1. 硬阴影边缘锐利无模糊，符合理想点光源硬阴影特征；
-2. 镜面球可反射红球与地面棋盘格，弹射次数越高，镜中反射细节越多；
-3. 加入法线偏移后，画面无黑色噪点，渲染精度大幅提升；
-4. UI滑块可实时交互，参数修改即时生效，渲染流畅稳定。
+## 五、运行与效果
 
-## 七、实验核心问题与解决方法
-| 问题现象 | 问题原因 | 解决措施 |
-| ---- | -------- | -------- |
-| 画面满屏黑色细小噪点 | 射线交点与自身表面自相交 | 射线起点沿法线偏移$1\times10^{-4}$ |
-| GPU递归报错、渲染卡顿 | GPU不支持递归函数调用 | 改用for循环迭代式光线追踪 |
-| 镜面反射无衰减、画面过亮 | 未设置光线能量吞吐量 | 引入throughput变量，每次反射乘以0.8反射率 |
-| 阴影边缘异常 | 暗影射线未做偏移处理 | 暗影射线与反射射线统一偏移阈值 |
-| 地面无纹理、纯色显示 | 未对平面交点做网格奇偶判断 | 基于x、z坐标实现棋盘格纹理采样 |
+### 5.1 运行方式
+确保已安装 Taichi，在终端执行：
+```
+python phong_demo.py
+```
 
-## 八、实验收获与总结
-1. **理论层面**：深刻区分了光线投射与光线追踪的差异，理解次级射线（暗影射线、反射射线）在全局光照中的核心作用，掌握Whitted风格光线追踪标准流程。
-2. **编程层面**：学会将递归算法改造为迭代循环算法，适配GPU并行计算特性；掌握射线几何求交、向量运算、材质分支调度的实现方法。
-3. **工程调试层面**：理解Shadow Acne自相交问题的成因与通用解决方案，掌握光照、阴影、镜面反射的参数调优逻辑。
-4. **框架应用层面**：熟练使用Taichi内核函数、场变量、UI交互控件，实现实时可交互的GPU光线追踪渲染。
+### 5.2 初始画面
+- 窗口 800×600，背景深青色。
+- 左侧红色球体，右侧紫色圆锥。
+- 球体和圆锥表面有明暗变化，带有白色高光。
 
-本实验完整实现了场景搭建、迭代光线追踪、硬阴影、镜面反射、棋盘格纹理与交互式参数调控，完全达成实验目标，深入理解了现代实时光线追踪的底层实现原理。
+### 5.3 UI 参数调节效果
+
+| 参数 | 增大后视觉变化 | 减小后视觉变化 |
+| :--- | :--- | :--- |
+| Ka | 整体变亮，暗部细节显现 | 整体变暗，阴影区域更黑 |
+| Kd | 漫反射增强，颜色更鲜艳 | 漫反射减弱，颜色变灰 |
+| Ks | 高光更亮、面积更广 | 高光变暗，表面更粗糙 |
+| Shininess | 高光区域缩小，更集中 | 高光扩散，更柔和 |
+
+### 5.4 遮挡验证
+球体与圆锥在场景中有重叠区域，由于实现了深度测试，远距离物体被正确遮挡，不会出现前后颠倒。
+
+---
+
+## 六、常见问题与解决办法
+
+| 现象 | 原因 | 解决方法 |
+| :--- | :--- | :--- |
+| 全黑画面 | 向量未归一化 | 确保所有向量用 `normalize` 处理 |
+| 出现黑色噪点 | N·L 为负未截断 | 使用 `ti.max(0.0, dot)` |
+| 颜色发白 | 累计值超过1.0 | 输出前 `ti.math.clamp(color, 0.0, 1.0)` |
+| 圆锥显示不完整 | 求交范围判断错误 | 检查局部 y 范围 `[-H, 0]` 和 t 的正负 |
+| 物体被错误遮挡 | 深度更新逻辑错误 | 确保 `if 0 < t_sph < min_t` 条件正确 |
+| UI 无响应 | 滑块未正确绑定 | 确认使用 `Ka[None] = gui.slider_float(...)` |
+
+---
+
+## 七、总结
+
+本次实验完整实现了基于光线投射的 Phong 光照模型渲染器，主要收获包括：
+
+- **光照模型理解**：通过手动实现三个分量，清晰区分了环境光提供基础亮度、漫反射决定明暗过渡、镜面高光带来光泽感的作用。
+- **向量运算实战**：熟练运用归一化、点积、反射向量等操作，并认识到归一化对正确光照的关键作用。
+- **光线求交与深度测试**：实现了球体和圆锥的隐式求交，并通过深度竞争处理遮挡，为后续复杂场景渲染打下基础。
+- **Taichi 并行编程**：利用 `@ti.kernel` 实现像素级并行，代码简洁高效，实时交互流畅。
+- **参数调优体验**：通过 UI 滑块实时调整材质参数，直观感受每个系数对视觉效果的影响，增强了图形直觉。
+
+本实验为后续学习更高级的渲染技术（如纹理映射、阴影、全局光照）奠定了坚实基础。所有必做功能均已正确实现并通过测试。
